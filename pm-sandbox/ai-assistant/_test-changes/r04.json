@@ -1,0 +1,16 @@
+{
+  "expected_revision": 3,
+  "summary": "R4 REQ-001确认（含转写接入调整），立项退出进入discovery，建立首个工作包",
+  "source_ref": "SRC-004",
+  "operations": [
+    {"op": "add", "collection": "sources", "record": {"id": "SRC-004", "kind": "user_message", "title": "确认验收条件；数据源改为腾讯会议转写接入", "locator": "R4:用户消息"}},
+    {"op": "revise", "collection": "requirements", "id": "REQ-001", "expected_version": 2, "patch": {
+      "trigger": "腾讯会议会终推送转写文本",
+      "boundaries": ["无人工确认不自动外发", "v1仅支持中文会议", "不包含日程功能", "依赖腾讯会议转写接口权限"]
+    }},
+    {"op": "transition", "collection": "requirements", "id": "REQ-001", "to": "confirmed", "reason": "用户R4明确确认验收条件与边界（含转写接入调整）", "source_ref": "SRC-004"},
+    {"op": "add", "collection": "decisions", "record": {"id": "DEC-001", "title": "纪要数据源：录音上传 → 腾讯会议转写接入", "decision": "直接消费腾讯会议转写文本，不做本地上传通道", "reason": "会议室无录音设备且团队统一使用腾讯会议", "source_refs": ["SRC-004"], "related_ids": ["REQ-001"]}},
+    {"op": "add", "collection": "work_packages", "record": {"id": "WP-001", "title": "纪要MVP：转写接入→草稿生成→人工确认→群发送", "status": "not_started", "owner": "开发者（本人）", "requirement_ids": ["REQ-001"], "due_at": "2026-10-18", "done_condition": "REQ-001 v3 全部验收条件通过"}},
+    {"op": "set_project", "patch": {"stage": "discovery", "active_mode": "daily", "owner": "开发者", "acceptor": "开发者（演示后部门负责人）", "in_scope": ["会议纪要：草稿生成-人工确认-群发送"], "out_of_scope": ["日程安排（延至11月）", "无人确认自动外发", "非中文会议"]}}
+  ]
+}

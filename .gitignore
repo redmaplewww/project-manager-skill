@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+pm-sandbox/ai-assistant/.project-to-act/local/
+write.lock
+write.lock.stale-*

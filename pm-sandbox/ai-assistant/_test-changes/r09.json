@@ -1,0 +1,14 @@
+{
+  "expected_revision": 8,
+  "summary": "R9 WP-001完成；EVD-001记录用户演示（3/4验收条件通过，检索未演示）；日程目标11-03改12-01（DEC-003保留原承诺）；API风险关闭",
+  "source_ref": "SRC-009",
+  "operations": [
+    {"op": "add", "collection": "sources", "record": {"id": "SRC-009", "kind": "user_message", "title": "功能完成自述；真实流程演示（8分钟出稿/确认/发群30人送达）；日程延期至12月", "locator": "R9:用户消息"}},
+    {"op": "transition", "collection": "work_packages", "id": "WP-001", "to": "done"},
+    {"op": "add", "collection": "evidence", "record": {"id": "EVD-001", "kind": "user_demo", "status": "valid", "related_ids": ["REQ-001"], "requirement_version": 3, "environment": "真实部门例会（腾讯会议，30人）", "method": "用户口述演示，未录屏", "observed": "60分钟会议会终8分钟生成结构化草稿（<10min ✓）；指定成员编辑并确认 ✓；确认后送达团队群30人 ✓", "unverified": "验收条件4「历史纪要可按日期检索」未演示", "source_refs": ["SRC-009"]}},
+    {"op": "transition", "collection": "milestones", "id": "MS-001", "to": "in_progress"},
+    {"op": "revise", "collection": "milestones", "id": "MS-002", "expected_version": 1, "patch": {"due_at": "2026-12-01", "note": "由2026-11-03延期至12-01，原承诺见变更历史与DEC-003"}},
+    {"op": "add", "collection": "decisions", "record": {"id": "DEC-003", "title": "日程协调交付延期", "decision": "目标日期2026-11-03 → 2026-12-01", "reason": "单人业余产能被纪要收尾占用，11-03不可达", "source_refs": ["SRC-009"], "related_ids": ["MS-002", "REQ-002", "RSK-001"]}},
+    {"op": "transition", "collection": "risks", "id": "RSK-002", "to": "closed"}
+  ]
+}

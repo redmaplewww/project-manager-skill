@@ -1,0 +1,11 @@
+{
+  "expected_revision": 7,
+  "summary": "R8 演示降级方案定案DEC-002；WP-001解除阻塞复工；RSK-002更新应对（选型咨询为日常问答，不落库）",
+  "source_ref": "SRC-008",
+  "operations": [
+    {"op": "add", "collection": "sources", "record": {"id": "SRC-008", "kind": "user_message", "title": "确认演示降级方案①；API加急已提交；咨询模型选型", "locator": "R8:用户消息"}},
+    {"op": "add", "collection": "decisions", "record": {"id": "DEC-002", "title": "10-20演示执行方案", "decision": "采用样例转写文本走完整流程演示（数据源降级、流程真实），并行等待API加急结果", "reason": "硬截止不可移动，API审批时间不可控", "source_refs": ["SRC-008"], "related_ids": ["MS-001", "WP-001", "RSK-002"]}},
+    {"op": "transition", "collection": "work_packages", "id": "WP-001", "to": "in_progress"},
+    {"op": "revise", "collection": "risks", "id": "RSK-002", "expected_version": 1, "patch": {"response": "加急申请已提交（R8）；演示降级方案已定（见DEC-002）"}}
+  ]
+}

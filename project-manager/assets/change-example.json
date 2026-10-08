@@ -1,0 +1,61 @@
+{
+  "expected_revision": 0,
+  "summary": "建立首个需求确认包",
+  "source_ref": "SRC-001",
+  "operations": [
+    {
+      "op": "add",
+      "collection": "sources",
+      "record": {
+        "id": "SRC-001",
+        "kind": "user_message",
+        "title": "用户提出的项目目标",
+        "locator": "session-id:message-id"
+      }
+    },
+    {
+      "op": "add",
+      "collection": "intake_items",
+      "record": {
+        "id": "ITM-001",
+        "title": "用户希望解决的核心问题",
+        "kind": "problem",
+        "disposition": "requirement",
+        "target_ids": ["REQ-001"],
+        "source_refs": ["SRC-001"]
+      }
+    },
+    {
+      "op": "add",
+      "collection": "scenarios",
+      "record": {
+        "id": "SCN-001",
+        "title": "核心用户完成主要任务",
+        "actor": "待确认",
+        "trigger": "待确认",
+        "success_signal": "待确认",
+        "source_refs": ["SRC-001"]
+      }
+    },
+    {
+      "op": "add",
+      "collection": "requirements",
+      "record": {
+        "id": "REQ-001",
+        "title": "首项可观察产品行为",
+        "scenario_id": "SCN-001",
+        "user_value": "待确认",
+        "trigger": "待确认",
+        "behavior": "待确认",
+        "outcome": "待确认",
+        "boundaries": ["待确认"],
+        "acceptance_criteria": [],
+        "source_refs": ["SRC-001"],
+        "intake_item_ids": ["ITM-001"],
+        "status": "clarification_needed",
+        "readiness": "not_ready",
+        "priority": "must"
+      }
+    }
+  ]
+}

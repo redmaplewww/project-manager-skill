@@ -1,0 +1,11 @@
+{
+  "expected_revision": 5,
+  "summary": "R6 排行榜拒绝、周报保持候选；WP-001开工；REV-001记录处置结论",
+  "source_ref": "SRC-006",
+  "operations": [
+    {"op": "add", "collection": "sources", "record": {"id": "SRC-006", "kind": "user_message", "title": "拒绝排行榜；周报延后；转写接入开发过半", "locator": "R6:用户消息"}},
+    {"op": "revise", "collection": "intake_items", "id": "ITM-007", "expected_version": 1, "patch": {"disposition": "rejected", "note": "用户R6拒绝；依据REV-001监控化风险"}},
+    {"op": "transition", "collection": "work_packages", "id": "WP-001", "to": "in_progress"},
+    {"op": "revise", "collection": "reviews", "id": "REV-001", "expected_version": 1, "patch": {"resolution": "用户R6采纳建议拒绝该提议；状态字段因工具限制停留open，处置以本字段为准"}}
+  ]
+}

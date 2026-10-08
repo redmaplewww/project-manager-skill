@@ -1,0 +1,11 @@
+{
+  "expected_revision": 6,
+  "summary": "R7 API权限阻塞：WP-001转blocked，预测改10-25，硬截止10-20保留，登记已发生风险",
+  "source_ref": "SRC-007",
+  "operations": [
+    {"op": "add", "collection": "sources", "record": {"id": "SRC-007", "kind": "user_message", "title": "腾讯会议API企业权限审批阻塞，预计10-25联调", "locator": "R7:用户消息"}},
+    {"op": "transition", "collection": "work_packages", "id": "WP-001", "to": "blocked"},
+    {"op": "revise", "collection": "work_packages", "id": "WP-001", "expected_version": 1, "patch": {"due_at": "2026-10-25", "blocker": "腾讯会议API企业权限审批中"}},
+    {"op": "add", "collection": "risks", "record": {"id": "RSK-002", "title": "腾讯会议API权限审批延迟", "status": "occurred", "impact": "纪要MVP联调阻塞，威胁10-20硬截止演示", "response": "演示降级方案+并行申请加急（待用户决定）", "source_refs": ["SRC-007"], "related_ids": ["WP-001", "MS-001"]}}
+  ]
+}

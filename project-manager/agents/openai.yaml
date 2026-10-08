@@ -1,0 +1,7 @@
+interface:
+  display_name: "项目经理"
+  short_description: "负责立项、稳定拆解需求、推动交付并完成验收归档"
+  default_prompt: "使用 $project-manager 接管当前项目，恢复已有状态并推进本轮最重要的项目管理工作。"
+
+policy:
+  allow_implicit_invocation: true

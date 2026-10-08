@@ -1,0 +1,18 @@
+{
+  "expected_revision": 2,
+  "summary": "R3 选定方案C：补全REQ-001契约并提交确认包，建立日程与复盘里程碑",
+  "source_ref": "SRC-003",
+  "operations": [
+    {"op": "add", "collection": "sources", "record": {"id": "SRC-003", "kind": "user_message", "title": "选定方案C；纪要需求描述：会后草稿-人工确认-发团队群", "locator": "R3:用户消息"}},
+    {"op": "revise", "collection": "requirements", "id": "REQ-001", "expected_version": 1, "patch": {
+      "behavior": "会终自动生成结构化纪要草稿（结论/待办/责任人）；指定成员可编辑；确认后发送到指定团队群",
+      "outcome": "纪要会终10分钟内可达全员，不再依赖人工补写",
+      "boundaries": ["无人工确认不自动外发", "v1仅支持中文会议", "不包含日程功能"],
+      "acceptance_criteria": ["60分钟内会议，会终10分钟内生成含结论/待办/责任人的结构化草稿", "指定成员可编辑并点击确认", "确认后1分钟内送达指定团队群", "历史纪要可按日期检索"],
+      "readiness": "ready_for_design"
+    }},
+    {"op": "transition", "collection": "requirements", "id": "REQ-001", "to": "pending_confirmation"},
+    {"op": "add", "collection": "milestones", "record": {"id": "MS-002", "title": "日程协调功能交付", "deadline_type": "target", "status": "planned", "due_at": "2026-11-03", "source_refs": ["SRC-003"]}},
+    {"op": "add", "collection": "milestones", "record": {"id": "MS-003", "title": "范围复盘（方案C检查点）", "deadline_type": "review", "status": "planned", "due_at": "2026-10-13", "source_refs": ["SRC-003"]}}
+  ]
+}

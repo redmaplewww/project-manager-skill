@@ -1,0 +1,17 @@
+{
+  "expected_revision": 1,
+  "summary": "R2 立项访谈：记录痛点/约束，形成两个候选需求与硬截止里程碑",
+  "source_ref": "SRC-002",
+  "operations": [
+    {"op": "add", "collection": "sources", "record": {"id": "SRC-002", "kind": "user_message", "title": "背景补充：30人团队、纪要丢失、日程冲突、10-20领导演示、1名开发业余时间", "locator": "R2:用户消息"}},
+    {"op": "add", "collection": "scenarios", "record": {"id": "SCN-001", "title": "团队会议纪要", "actor": "部门成员（30人）", "trigger": "会议结束", "preconditions": "使用腾讯会议召开", "steps": "待确认", "success_signal": "纪要草稿生成并可确认共享", "source_refs": ["SRC-002"], "intake_item_ids": ["ITM-001"]}},
+    {"op": "add", "collection": "requirements", "record": {"id": "REQ-001", "title": "会后生成会议纪要草稿", "scenario_id": "SCN-001", "user_value": "纪要不再依赖人工补写、不再丢失", "trigger": "会议结束", "behavior": "待确认", "outcome": "待确认", "boundaries": ["待确认"], "acceptance_criteria": [], "source_refs": ["SRC-002"], "intake_item_ids": ["ITM-003"], "status": "candidate", "readiness": "not_ready", "priority": "must"}},
+    {"op": "add", "collection": "scenarios", "record": {"id": "SCN-002", "title": "团队日程协调", "actor": "待确认", "trigger": "待确认", "success_signal": "待确认", "source_refs": ["SRC-002"], "intake_item_ids": ["ITM-002"]}},
+    {"op": "add", "collection": "requirements", "record": {"id": "REQ-002", "title": "日程安排协助", "scenario_id": "SCN-002", "user_value": "减少日程冲突与群内协调成本", "trigger": "待确认", "behavior": "待确认", "outcome": "待确认", "boundaries": ["待确认"], "acceptance_criteria": [], "source_refs": ["SRC-002"], "intake_item_ids": ["ITM-004"], "status": "candidate", "readiness": "not_ready", "priority": "should"}},
+    {"op": "add", "collection": "intake_items", "record": {"id": "ITM-003", "title": "会议纪要无人撰写且经常丢失", "kind": "problem", "disposition": "requirement", "target_ids": ["REQ-001"], "source_refs": ["SRC-002"]}},
+    {"op": "add", "collection": "intake_items", "record": {"id": "ITM-004", "title": "日程靠群内口头协调、经常冲突", "kind": "problem", "disposition": "requirement", "target_ids": ["REQ-002"], "source_refs": ["SRC-002"]}},
+    {"op": "add", "collection": "intake_items", "record": {"id": "ITM-005", "title": "约束：1名开发者，业余时间投入", "kind": "constraint", "disposition": "constraint", "source_refs": ["SRC-002"]}},
+    {"op": "add", "collection": "risks", "record": {"id": "RSK-001", "title": "单人业余时间产能不足以支撑双场景并行", "status": "open", "impact": "演示延期或范围失控", "response": "范围分批：演示前仅交付纪要单场景", "source_refs": ["SRC-002"]}},
+    {"op": "add", "collection": "milestones", "record": {"id": "MS-001", "title": "部门例会领导演示", "deadline_type": "hard", "status": "planned", "due_at": "2026-10-20", "source_refs": ["SRC-002"]}}
+  ]
+}

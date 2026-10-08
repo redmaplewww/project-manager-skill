@@ -1,0 +1,8 @@
+{
+  "expected_revision": 9,
+  "summary": "修复验证：REV-001 状态经 revise 正式关闭（修复前只能绕道 resolution 字段）",
+  "source_ref": "SRC-006",
+  "operations": [
+    {"op": "revise", "collection": "reviews", "id": "REV-001", "expected_version": 2, "patch": {"status": "closed", "resolution": "用户R6采纳建议拒绝该提议"}}
+  ]
+}

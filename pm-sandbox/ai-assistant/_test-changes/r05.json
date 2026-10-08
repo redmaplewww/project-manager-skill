@@ -1,0 +1,11 @@
+{
+  "expected_revision": 4,
+  "summary": "R5 范围候选：周报/排行榜记为候选不进范围，排行榜记产品风险评审",
+  "source_ref": "SRC-005",
+  "operations": [
+    {"op": "add", "collection": "sources", "record": {"id": "SRC-005", "kind": "user_message", "title": "新增提议：自动周报、会议贡献排行榜", "locator": "R5:用户消息"}},
+    {"op": "add", "collection": "intake_items", "record": {"id": "ITM-006", "title": "自动周报（汇总本周纪要与待办）", "kind": "candidate_idea", "disposition": "candidate", "source_refs": ["SRC-005"]}},
+    {"op": "add", "collection": "intake_items", "record": {"id": "ITM-007", "title": "会议贡献排行榜", "kind": "candidate_idea", "disposition": "candidate", "source_refs": ["SRC-005"]}},
+    {"op": "add", "collection": "reviews", "record": {"id": "REV-001", "title": "排行榜会把减负工具推向监控工具", "kind": "risk", "impact": "成员因被统计而降低使用意愿，与「减负」定位冲突，损害团队信任", "recommendation": "不做；若确需度量贡献，改为仅本人可见的个人统计", "status": "open", "source_refs": ["SRC-005"], "related_ids": ["ITM-007"]}}
+  ]
+}

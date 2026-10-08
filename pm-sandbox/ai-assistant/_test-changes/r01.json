@@ -1,0 +1,11 @@
+{
+  "expected_revision": 0,
+  "summary": "R1 立项启动：记录原始诉求与两个候选场景，进入立项模式",
+  "source_ref": "SRC-001",
+  "operations": [
+    {"op": "add", "collection": "sources", "record": {"id": "SRC-001", "kind": "user_message", "title": "开发者立项诉求：团队AI智能助手（会议纪要、日程安排等日常杂事）", "locator": "R1:用户消息"}},
+    {"op": "add", "collection": "intake_items", "record": {"id": "ITM-001", "title": "会议纪要自动化", "kind": "scenario", "disposition": "candidate", "source_refs": ["SRC-001"]}},
+    {"op": "add", "collection": "intake_items", "record": {"id": "ITM-002", "title": "日程安排协助", "kind": "scenario", "disposition": "candidate", "source_refs": ["SRC-001"]}},
+    {"op": "set_project", "patch": {"active_mode": "initiation", "goal": "为内部团队提供AI智能助手，处理会议纪要、日程安排等日常事务（立项草案，待基线确认）"}}
+  ]
+}
