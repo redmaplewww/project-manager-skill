@@ -139,6 +139,62 @@ class ProjectManagerTests(unittest.TestCase):
         self.assertEqual(req["version"], 1)
         self.assertEqual(req["status"], "confirmed")
 
+    def test_progress_summary_exposes_action_owner_due_and_acceptance(self) -> None:
+        self.seed_requirement()
+        self.apply(
+            {
+                "expected_revision": 1,
+                "operations": [
+                    {
+                        "op": "add",
+                        "collection": "work_packages",
+                        "record": {
+                            "id": "WP-001",
+                            "title": "实现进展提交闭环",
+                            "status": "in_progress",
+                            "owner": "项目开发者",
+                            "due_at": "2026-10-20",
+                            "requirement_ids": ["REQ-001"],
+                        },
+                    }
+                ],
+            }
+        )
+        summary = pm.build_progress_summary(self.root, pm.load_state(self.root))
+        action = summary["next_actions"][0]
+        self.assertEqual(action["id"], "WP-001")
+        self.assertEqual(action["owner"], "项目开发者")
+        self.assertEqual(action["due_at"], "2026-10-20")
+        self.assertEqual(action["acceptance_criteria"], ["提交后主管可查看相同内容"])
+        self.assertEqual(action["missing"], [])
+
+    def test_daily_progress_aggregates_state_changes_and_completion(self) -> None:
+        state = pm.default_state("PM-TEST", "测试项目", "Asia/Shanghai")
+        state["work_packages"] = [{"id": "WP-001", "title": "交付工作包", "status": "done"}]
+        state["change_events"] = [
+            {
+                "revision": 1,
+                "timestamp": "2026-10-10T16:30:00Z",
+                "summary": "推进工作包",
+                "operations": [
+                    {"op": "transition", "collection": "work_packages", "id": "WP-001", "from": "in_progress", "to": "done"}
+                ],
+            }
+        ]
+        daily = pm.build_daily_progress(state, [])
+        self.assertEqual(daily[0]["date"], "2026-10-11")
+        self.assertEqual(daily[0]["state_changes"], 1)
+        self.assertEqual(daily[0]["completed_items"], ["WP-001 · 交付工作包"])
+        self.assertIn("状态变更：WP-001 · 交付工作包 · in_progress → done", daily[0]["change_details"][0]["operations"])
+        self.assertIn("完成开发工作包 1 项", daily[0]["daily_summary"])
+        self.assertIn("开发工作包", daily[0]["change_groups"])
+        self.assertEqual(daily[0]["change_groups"]["开发工作包"][0]["revision"], 1)
+        self.assertEqual(daily[0]["progress_delta"]["work_packages_completed"], ["WP-001 · 交付工作包"])
+        self.assertEqual(daily[0]["current_snapshot"]["work_packages_done"], 1)
+        self.assertIn("开发拆解与纵向交付验证", daily[0]["synthesis"])
+        self.assertIn("完成 1 个工作包并形成验证结果", daily[0]["synthesis"])
+        self.assertIn("当前累计为需求确认", daily[0]["synthesis"])
+
     def test_confirmed_semantic_revision_requires_change_metadata(self) -> None:
         self.seed_requirement()
         self.apply(
@@ -335,6 +391,283 @@ class ProjectManagerTests(unittest.TestCase):
         result, code = pm.cmd_check(argparse.Namespace(project_root=self.root, strict=False))
         self.assertEqual(code, 0)
         self.assertTrue(any(item["code"] == "CONFIRMED_WITHOUT_WORK_PACKAGE" for item in result["warnings"]))
+
+    def test_build_readiness_requires_feature_shaping_gate(self) -> None:
+        self.seed_requirement()
+        with self.assertRaises(pm.PMError):
+            self.apply(
+                {
+                    "expected_revision": 1,
+                    "operations": [
+                        {
+                            "op": "revise",
+                            "collection": "requirements",
+                            "id": "REQ-001",
+                            "expected_version": 1,
+                            "patch": {"readiness": "ready_for_build"},
+                        }
+                    ],
+                }
+            )
+
+    def test_build_readiness_accepts_complete_feature_shaping_gate(self) -> None:
+        self.seed_requirement()
+        self.apply(
+            {
+                "expected_revision": 1,
+                "operations": [
+                    {
+                        "op": "revise",
+                        "collection": "requirements",
+                        "id": "REQ-001",
+                        "expected_version": 1,
+                        "patch": {
+                            "product_form": {
+                                "user_and_trigger": "confirmed",
+                                "main_flow": "confirmed",
+                                "non_goals": ["none"],
+                                "diagram_refs": ["flow-1"],
+                            },
+                            "experience_review": {
+                                "normal_cases": ["happy"],
+                                "edge_cases": ["empty", "error"],
+                                "accessibility_and_responsive": "reviewed",
+                                "interaction_contract": {
+                                    "entry_controls": "documented",
+                                    "feedback_states": "documented",
+                                    "empty_loading_error": "documented",
+                                    "retry_cancel_recovery": "documented",
+                                    "accessibility_responsive": "reviewed",
+                                },
+                            },
+                            "technical_design": {
+                                "stack": "existing project stack",
+                                "architecture_ref": "arch-1",
+                                "data_contract": "reviewed",
+                                "security_and_operations": "reviewed",
+                            },
+                            "implementation_contract": {
+                                "discovery_method": "repository and runtime inspection",
+                                "implementation_surfaces": [
+                                    {
+                                        "name": "discovered surface",
+                                        "evidence": ["src/example.tsx"],
+                                        "current_structure": "documented",
+                                        "decision": "documented",
+                                        "behavior_impact": "assessed",
+                                        "verification": "defined",
+                                        "task_mapping": "WP-001",
+                                        "execution_steps": ["step-1"],
+                                        "interfaces_or_data": "documented",
+                                        "failure_and_rollback": "documented",
+                                        "observability": "documented",
+                                        "test_mapping": ["AC-001"],
+                                    }
+                                ],
+                                "functional_decomposition": [
+                                    {"id": "FU-001", "title": "提交进展", "actor": "成员", "trigger": "有更新", "preconditions": ["项目存在"], "inputs": ["进展文本"], "steps": ["校验", "保存"], "outputs": ["可查看记录"], "state_transitions": ["draft->saved"], "errors": ["保存失败"], "acceptance": ["AC-001"], "implementation_mapping": ["WP-001"]}
+                                ],
+                                "state_model": [
+                                    {"state": "ready", "entry": "打开项目", "visible_behavior": "可提交", "allowed_actions": ["提交"], "exit": "保存或失败", "retention": "输入保留"}
+                                ],
+                                "verification_matrix": [
+                                    {"id": "VM-001", "scenario": "正常提交", "expected": "记录可查看", "method": "pytest", "evidence_or_test": "test_submit"}
+                                ],
+                                "decisions": ["DEC-001"],
+                                "unresolved_items": [],
+                                "task_breakdown": "reviewed",
+                            },
+                            "acceptance_scenarios": [{"id": "AC-001", "given": "项目存在", "when": "成员提交进展", "then": "主管可查看", "verification": "pytest test_submit"}],
+                            "feature_shaping_rounds": {
+                                "completion_policy": "五轮均完成且未决项关闭",
+                                "rounds": [
+                                    {"round": 1, "status": "complete", "questions": ["谁使用"], "conclusions": ["成员"], "evidence": ["SRC-001"], "unresolved_items": [], "confirmation_source": "SRC-001"},
+                                    {"round": 2, "status": "complete", "questions": ["失败如何反馈"], "conclusions": ["显示错误"], "evidence": ["SRC-001"], "unresolved_items": [], "confirmation_source": "SRC-001"},
+                                    {"round": 3, "status": "complete", "questions": ["数据如何保存"], "conclusions": ["项目隔离"], "evidence": ["SRC-001"], "unresolved_items": [], "confirmation_source": "SRC-001"},
+                                    {"round": 4, "status": "complete", "questions": ["如何实现"], "conclusions": ["复用现有结构"], "evidence": ["SRC-001"], "unresolved_items": [], "confirmation_source": "SRC-001"},
+                                    {"round": 5, "status": "confirmed", "questions": ["如何验收"], "conclusions": ["测试通过"], "evidence": ["SRC-001"], "unresolved_items": [], "confirmation_source": "SRC-001"}
+                                ]
+                            },
+                            "open_questions": [],
+                            "gate": {
+                                "status": "approved",
+                                "review_lenses": [
+                                    {
+                                        "name": "discovered-lens",
+                                        "question": "documented",
+                                        "conclusion": "documented",
+                                        "evidence": ["SRC-001"],
+                                        "unresolved": [],
+                                    }
+                                ],
+                                "confirmed_source": "SRC-001",
+                                "confirmation_protocol": "explicit_scope_confirmation",
+                                "confirmed_scope_statement": "用户明确确认成员提交进展并由主管查看。",
+                            },
+                        },
+                    },
+                    {
+                        "op": "transition",
+                        "collection": "requirements",
+                        "id": "REQ-001",
+                        "to": "confirmed",
+                        "reason": "feature shaping complete",
+                        "source_ref": "SRC-001",
+                    },
+                    {
+                        "op": "revise",
+                        "collection": "requirements",
+                        "id": "REQ-001",
+                        "expected_version": 2,
+                        "patch": {"readiness": "ready_for_build"},
+                        "reason": "feature gate approved",
+                        "source_ref": "SRC-001",
+                        "change_class": "wording_only",
+                    },
+                ],
+            }
+        )
+        state = pm.load_state(self.root)
+        self.assertEqual(state["requirements"][0]["readiness"], "ready_for_build")
+        self.apply(
+            {
+                "expected_revision": 2,
+                "operations": [
+                    {
+                        "op": "revise",
+                        "collection": "requirements",
+                        "id": "REQ-001",
+                        "expected_version": 3,
+                        "patch": {"behavior": "updated behavior"},
+                        "reason": "new product behavior",
+                        "source_ref": "SRC-001",
+                        "change_class": "addition",
+                    }
+                ],
+            }
+        )
+        state = pm.load_state(self.root)
+        self.assertEqual(state["requirements"][0]["readiness"], "ready_for_design")
+
+    def test_shallow_feature_package_is_rejected(self) -> None:
+        self.seed_requirement()
+        self.apply({
+            "expected_revision": 1,
+            "operations": [
+                {
+                    "op": "revise",
+                    "collection": "requirements",
+                    "id": "REQ-001",
+                    "expected_version": 1,
+                    "patch": {
+                        "product_form": {"user_and_trigger": "x", "main_flow": "x", "non_goals": ["x"], "diagram_refs": ["x"]},
+                        "experience_review": {"normal_cases": ["x"], "edge_cases": ["x"], "accessibility_and_responsive": "x", "interaction_contract": {"entry_controls": "x", "feedback_states": "x", "empty_loading_error": "x", "retry_cancel_recovery": "x", "accessibility_responsive": "x"}},
+                        "technical_design": {"stack": "x", "architecture_ref": "x", "data_contract": "x", "security_and_operations": "x"},
+                        "implementation_contract": {"discovery_method": "x", "implementation_surfaces": [{"name": "x", "evidence": ["x"], "current_structure": "x", "decision": "x", "behavior_impact": "x", "verification": "x", "task_mapping": "x", "execution_steps": ["x"], "interfaces_or_data": "x", "failure_and_rollback": "x", "observability": "x", "test_mapping": ["x"]}], "functional_decomposition": [], "state_model": [], "verification_matrix": [], "decisions": [], "unresolved_items": [], "task_breakdown": "x"},
+                        "acceptance_scenarios": [], "feature_shaping_rounds": {"completion_policy": "x", "rounds": []}, "open_questions": [], "gate": {"status": "approved", "review_lenses": [], "confirmed_source": "SRC-001", "confirmation_protocol": "explicit_scope_confirmation", "confirmed_scope_statement": "x"}
+                    },
+                }
+            ],
+        })
+        with self.assertRaises(pm.PMError):
+            self.apply({"expected_revision": 2, "operations": [{"op": "revise", "collection": "requirements", "id": "REQ-001", "expected_version": 2, "patch": {"readiness": "ready_for_build"}, "reason": "尝试浅门禁", "source_ref": "SRC-001", "change_class": "wording_only"}]})
+
+    def test_confirmation_package_requires_per_question_recommendations(self) -> None:
+        self.seed_requirement()
+        invalid_package = {
+            "requirement_id": "REQ-001",
+            "requirement_version": 1,
+            "protocol": "single_umbrella_question",
+            "presented_in_conversation": True,
+            "bulk_accept_phrase": "按本 REQ 推荐全部采纳",
+            "questions": [{"id": "DQ-001", "question": "是否确认全部？"}],
+        }
+        with self.assertRaises(pm.PMError):
+            self.apply({
+                "expected_revision": 1,
+                "operations": [{
+                    "op": "revise", "collection": "requirements", "id": "REQ-001",
+                    "expected_version": 1, "patch": {"confirmation_package": invalid_package},
+                    "reason": "验证确认协议", "source_ref": "SRC-001", "change_class": "addition",
+                }],
+            })
+
+    def test_confirmation_package_accepts_separate_questions_with_recommendations(self) -> None:
+        self.seed_requirement()
+        question = {
+            "id": "DQ-001", "question": "本期是否保留撤销？", "current_conclusion": "撤销会影响状态回滚",
+            "recommendation": "保留撤销并限制为最近一次操作", "alternatives": ["不提供撤销"],
+            "basis": "用户路径调查", "behavior_impact": "用户可撤销最近一次操作",
+            "implementation_impact": "增加操作日志和回滚接口", "acceptance_impact": "验收撤销后状态一致",
+            "status": "open", "answer": None, "requirement_version": 2,
+            "source_ref": "SRC-001", "asked_at": "2026-10-11T00:00:00Z",
+        }
+        package = {
+            "requirement_id": "REQ-001", "requirement_version": 2,
+            "protocol": "per_question_with_recommendations", "presented_in_conversation": True,
+            "bulk_accept_phrase": "按本 REQ 推荐全部采纳", "questions": [question],
+        }
+        result = self.apply({
+            "expected_revision": 1,
+            "operations": [{
+                "op": "revise", "collection": "requirements", "id": "REQ-001",
+                "expected_version": 1, "patch": {"confirmation_package": package, "decision_questions": [question]},
+                "reason": "保存逐项确认包", "source_ref": "SRC-001", "change_class": "addition",
+            }],
+        })
+        self.assertEqual(result["revision"], 2)
+
+    def test_confirmation_lock_blocks_reopening_scope(self) -> None:
+        self.seed_requirement()
+        self.apply({
+            "expected_revision": 1,
+            "operations": [{
+                "op": "revise", "collection": "requirements", "id": "REQ-001",
+                "expected_version": 1,
+                "patch": {"confirmation_lock": {
+                    "status": "locked", "locked_version": 2, "locked_source_ref": "SRC-001",
+                    "locked_at": "2026-10-11T00:00:00Z", "reason": "冻结确认范围",
+                    "reopen_policy": "only_explicit_scope_change_request",
+                }},
+                "reason": "冻结确认范围", "source_ref": "SRC-001", "change_class": "correction",
+            }],
+        })
+        with self.assertRaises(pm.PMError):
+            self.apply({
+                "expected_revision": 2,
+                "operations": [{
+                    "op": "revise", "collection": "requirements", "id": "REQ-001",
+                    "expected_version": 2, "patch": {"open_questions": ["不应重新打开"]},
+                    "reason": "尝试重开", "source_ref": "SRC-001", "change_class": "correction",
+                }],
+            })
+
+    def test_confirmation_lock_has_explicit_unlock_path(self) -> None:
+        self.seed_requirement()
+        self.apply({
+            "expected_revision": 1,
+            "operations": [{
+                "op": "revise", "collection": "requirements", "id": "REQ-001",
+                "expected_version": 1,
+                "patch": {"confirmation_lock": {
+                    "status": "locked", "locked_version": 2, "locked_source_ref": "SRC-001",
+                    "locked_at": "2026-10-11T00:00:00Z", "reason": "冻结确认范围",
+                    "reopen_policy": "only_explicit_scope_change_request",
+                }},
+                "reason": "冻结确认范围", "source_ref": "SRC-001", "change_class": "correction",
+            }],
+        })
+        result = self.apply({
+            "expected_revision": 2,
+            "operations": [{
+                "op": "unlock_confirmation", "collection": "requirements", "id": "REQ-001",
+                "reason": "用户明确提出范围变更", "source_ref": "SRC-001",
+            }],
+        })
+        self.assertEqual(result["revision"], 3)
+        state = pm.load_state(self.root)
+        self.assertEqual(state["requirements"][0]["status"], "pending_confirmation")
+        self.assertNotIn("confirmation_lock", state["requirements"][0])
 
     def test_deadline_uses_project_timezone_and_surfaces_overdue(self) -> None:
         self.apply(

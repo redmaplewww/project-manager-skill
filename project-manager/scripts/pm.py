@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import copy
 import hashlib
+from html import escape as html_escape
 import json
 import os
 import re
@@ -22,6 +23,7 @@ SCHEMA_VERSION = 1
 DOCS_REL = Path(".project-to-act/docs/project-manager")
 LOCAL_REL = Path(".project-to-act/local/project-manager")
 STATE_NAME = "state.json"
+PROJECT_OVERVIEW_NAME = "PROJECT_OVERVIEW.html"
 COLLECTIONS = {
     "sources": "SRC-",
     "intake_items": "ITM-",
@@ -39,9 +41,60 @@ PROJECT_STAGES = {
 }
 MODES = {"daily", "initiation", "midterm", "closure", "adjustment"}
 REQUIREMENT_STATUSES = {
-    "candidate", "clarification_needed", "pending_confirmation", "confirmed", "rejected", "superseded"
+    "candidate", "clarification_needed", "pending_confirmation", "ai_confirmed_unverified", "confirmed", "rejected", "superseded"
 }
-READINESS = {"not_ready", "ready_for_design", "ready_for_build", "ready_for_acceptance"}
+DECISION_QUESTION_STATUSES = {"open", "accepted", "overridden", "deferred"}
+DECISION_QUESTION_FIELDS = {
+    "id", "question", "current_conclusion", "recommendation", "alternatives",
+    "basis", "behavior_impact", "implementation_impact", "acceptance_impact",
+    "status", "answer", "requirement_version", "source_ref", "asked_at",
+}
+CONFIRMATION_PACKAGE_FIELDS = {
+    "requirement_id", "requirement_version", "protocol", "presented_in_conversation",
+    "bulk_accept_phrase", "questions",
+}
+CONFIRMATION_LOCK_FIELDS = {
+    "status", "locked_version", "locked_source_ref", "locked_at", "reason", "reopen_policy",
+}
+CONFIRMATION_PROTECTED_FIELDS = {
+    "title", "scenario_id", "user_value", "trigger", "behavior", "outcome", "boundaries",
+    "acceptance_criteria", "source_refs", "status", "readiness", "priority",
+    "decision_questions", "confirmation_package", "open_questions", "product_form",
+    "experience_review", "technical_design", "implementation_contract", "acceptance_scenarios",
+    "feature_shaping_rounds", "gate", "failure_policy", "search_policy", "deletion_policy",
+    "switch_policy", "startup_policy", "transfer_policy", "creation_template", "module_id",
+    "module_title", "related_requirement_ids", "coupling_level", "interaction_note",
+    "interaction_contracts", "interface_spec", "extension_module_id", "extension_module_title",
+    "extension_contract", "human_verification",
+}
+READINESS = {"not_ready", "ready_for_design", "ready_for_build", "ready_for_acceptance", "confirmed_for_extension"}
+BUILD_READINESS = {"ready_for_build", "ready_for_acceptance"}
+BUILD_GATE_SECTIONS = {
+    "product_form",
+    "experience_review",
+    "technical_design",
+    "implementation_contract",
+    "acceptance_scenarios",
+    "feature_shaping_rounds",
+    "gate",
+}
+BUILD_GATE_FIELDS = {
+    "product_form": {"user_and_trigger", "main_flow", "non_goals", "diagram_refs"},
+    "experience_review": {"normal_cases", "edge_cases", "accessibility_and_responsive", "interaction_contract"},
+    "technical_design": {"stack", "architecture_ref", "data_contract", "security_and_operations"},
+    "implementation_contract": {
+        "discovery_method",
+        "implementation_surfaces",
+        "functional_decomposition",
+        "state_model",
+        "verification_matrix",
+        "decisions",
+        "unresolved_items",
+        "task_breakdown",
+    },
+    "feature_shaping_rounds": {"rounds", "completion_policy"},
+    "gate": {"status", "review_lenses", "confirmed_source", "confirmation_protocol", "confirmed_scope_statement"},
+}
 WORK_STATUSES = {"not_started", "in_progress", "blocked", "done", "cancelled"}
 MILESTONE_STATUSES = {"planned", "in_progress", "blocked", "reached", "missed", "cancelled"}
 RISK_STATUSES = {"open", "mitigating", "accepted", "closed", "occurred"}
@@ -60,8 +113,9 @@ ALLOWED_TRANSITIONS = {
     "requirements": {
         "candidate": {"clarification_needed", "pending_confirmation", "rejected"},
         "clarification_needed": {"candidate", "pending_confirmation", "rejected"},
-        "pending_confirmation": {"clarification_needed", "confirmed", "rejected"},
-        "confirmed": {"superseded", "rejected"},
+        "pending_confirmation": {"clarification_needed", "ai_confirmed_unverified", "confirmed", "rejected"},
+        "ai_confirmed_unverified": {"pending_confirmation", "confirmed", "superseded", "rejected"},
+        "confirmed": {"pending_confirmation", "superseded", "rejected"},
         "rejected": {"candidate"},
         "superseded": set(),
     },
@@ -251,8 +305,228 @@ def validate_record(collection: str, record: dict[str, Any]) -> None:
             raise PMError(f"invalid priority for {record_id}")
         if not record.get("source_refs"):
             raise PMError(f"{record_id} requires source_refs")
-        if record.get("status") == "confirmed" and not record.get("acceptance_criteria"):
-            raise PMError(f"confirmed requirement {record_id} requires acceptance_criteria")
+        confirmation_lock = record.get("confirmation_lock")
+        if confirmation_lock is not None:
+            if not isinstance(confirmation_lock, dict):
+                raise PMError(f"{record_id}.confirmation_lock must be an object")
+            missing_lock_fields = sorted(CONFIRMATION_LOCK_FIELDS - set(confirmation_lock))
+            if missing_lock_fields:
+                raise PMError(
+                    f"{record_id}.confirmation_lock is missing: {', '.join(missing_lock_fields)}"
+                )
+            if confirmation_lock.get("status") != "locked":
+                raise PMError(f"{record_id}.confirmation_lock.status must be locked")
+            if confirmation_lock.get("locked_version") != record.get("version"):
+                raise PMError(f"{record_id}.confirmation_lock.locked_version must match the requirement version")
+            if not str(confirmation_lock.get("locked_source_ref", "")).startswith("SRC-"):
+                raise PMError(f"{record_id}.confirmation_lock.locked_source_ref must reference a source")
+            if confirmation_lock.get("reopen_policy") != "only_explicit_scope_change_request":
+                raise PMError(f"{record_id}.confirmation_lock.reopen_policy is invalid")
+
+        confirmation_package = record.get("confirmation_package")
+        if confirmation_package is not None:
+            if not isinstance(confirmation_package, dict):
+                raise PMError(f"{record_id}.confirmation_package must be an object")
+            missing_package_fields = sorted(CONFIRMATION_PACKAGE_FIELDS - set(confirmation_package))
+            if missing_package_fields:
+                raise PMError(
+                    f"{record_id}.confirmation_package is missing: {', '.join(missing_package_fields)}"
+                )
+            if confirmation_package.get("requirement_id") != record_id:
+                raise PMError(f"{record_id}.confirmation_package.requirement_id must match the requirement")
+            if confirmation_package.get("requirement_version") != record.get("version"):
+                raise PMError(f"{record_id}.confirmation_package.requirement_version must match the requirement version")
+            if confirmation_package.get("protocol") != "per_question_with_recommendations":
+                raise PMError(f"{record_id}.confirmation_package.protocol must be per_question_with_recommendations")
+            if confirmation_package.get("presented_in_conversation") is not True:
+                raise PMError(f"{record_id}.confirmation_package must be presented in the current conversation")
+            if confirmation_package.get("bulk_accept_phrase") != "按本 REQ 推荐全部采纳":
+                raise PMError(f"{record_id}.confirmation_package.bulk_accept_phrase is invalid")
+            package_questions = confirmation_package.get("questions")
+            if not isinstance(package_questions, list) or not package_questions:
+                raise PMError(f"{record_id}.confirmation_package.questions must be a non-empty list")
+            package_ids = set()
+            for index, question in enumerate(package_questions):
+                if not isinstance(question, dict):
+                    raise PMError(f"{record_id}.confirmation_package.questions[{index}] must be an object")
+                missing = sorted(DECISION_QUESTION_FIELDS - set(question))
+                if missing:
+                    raise PMError(
+                        f"{record_id}.confirmation_package.questions[{index}] is missing: {', '.join(missing)}"
+                    )
+                qid = question.get("id")
+                if not isinstance(qid, str) or not qid.startswith("DQ-") or qid in package_ids:
+                    raise PMError(f"{record_id}.confirmation_package.questions[{index}].id is invalid or duplicated")
+                package_ids.add(qid)
+                if not str(question.get("question", "")).strip() or not str(question.get("current_conclusion", "")).strip():
+                    raise PMError(f"{record_id}.confirmation_package.questions[{index}] requires a question and current_conclusion")
+                if not str(question.get("recommendation", "")).strip() or not isinstance(question.get("alternatives"), list) or not question.get("alternatives"):
+                    raise PMError(f"{record_id}.confirmation_package.questions[{index}] requires recommendation and alternatives")
+                if question.get("status") not in DECISION_QUESTION_STATUSES:
+                    raise PMError(f"invalid confirmation question status for {record_id}: {qid}")
+
+        decision_questions = record.get("decision_questions")
+        if decision_questions is not None:
+            if not isinstance(decision_questions, list):
+                raise PMError(f"{record_id}.decision_questions must be a list")
+            seen_question_ids: set[str] = set()
+            for index, question in enumerate(decision_questions):
+                if not isinstance(question, dict):
+                    raise PMError(f"{record_id}.decision_questions[{index}] must be an object")
+                missing_question_fields = sorted(DECISION_QUESTION_FIELDS - set(question))
+                if missing_question_fields:
+                    raise PMError(
+                        f"{record_id}.decision_questions[{index}] is missing: {', '.join(missing_question_fields)}"
+                    )
+                question_id = question.get("id")
+                if not isinstance(question_id, str) or not question_id.startswith("DQ-"):
+                    raise PMError(f"{record_id}.decision_questions[{index}].id must start with DQ-")
+                if question_id in seen_question_ids:
+                    raise PMError(f"duplicate decision question id {question_id} in {record_id}")
+                seen_question_ids.add(question_id)
+                if question.get("status") not in DECISION_QUESTION_STATUSES:
+                    raise PMError(f"invalid decision question status for {record_id}: {question_id}")
+                if not str(question.get("question", "")).strip():
+                    raise PMError(f"{record_id}.decision_questions[{index}].question must not be empty")
+                if not str(question.get("recommendation", "")).strip():
+                    raise PMError(f"{record_id}.decision_questions[{index}].recommendation must not be empty")
+                if not isinstance(question.get("alternatives"), list):
+                    raise PMError(f"{record_id}.decision_questions[{index}].alternatives must be a list")
+                if question.get("status") in {"accepted", "overridden"}:
+                    if question.get("answer") in (None, "") or not question.get("source_ref"):
+                        raise PMError(
+                            f"answered decision question {record_id}:{question_id} requires answer and source_ref"
+                        )
+        if record.get("status") in {"confirmed", "ai_confirmed_unverified"} and not record.get("acceptance_criteria"):
+            raise PMError(f"{record.get('status')} requirement {record_id} requires acceptance_criteria")
+        if record.get("status") == "ai_confirmed_unverified":
+            if record.get("human_verification") != "unverified":
+                raise PMError(f"{record_id} AI-confirmed requirement must set human_verification=unverified")
+            mapping = record.get("code_mapping")
+            if not isinstance(mapping, list) or not mapping:
+                raise PMError(f"{record_id} AI-confirmed requirement requires code_mapping")
+        if record.get("readiness") in BUILD_READINESS:
+            missing = sorted(BUILD_GATE_SECTIONS - set(record))
+            if missing:
+                raise PMError(
+                    f"{record_id} at {record['readiness']} requires feature-shaping sections: {', '.join(missing)}"
+                )
+            if record.get("status") not in {"confirmed", "ai_confirmed_unverified"}:
+                raise PMError(f"{record_id} must be confirmed or AI-confirmed before {record['readiness']}")
+            for section, fields in BUILD_GATE_FIELDS.items():
+                value = record.get(section)
+                if not isinstance(value, dict):
+                    raise PMError(f"{record_id} requires {section} review")
+                missing_fields = sorted(fields - set(value))
+                if missing_fields:
+                    raise PMError(
+                        f"{record_id}.{section} is missing: {', '.join(missing_fields)}"
+                    )
+            implementation = record["implementation_contract"]
+            surfaces = implementation["implementation_surfaces"]
+            if not isinstance(surfaces, list) or not surfaces:
+                raise PMError(f"{record_id}.implementation_contract.implementation_surfaces must be non-empty")
+            surface_fields = {
+                "name",
+                "evidence",
+                "current_structure",
+                "decision",
+                "behavior_impact",
+                "verification",
+                "task_mapping",
+                "execution_steps",
+                "interfaces_or_data",
+                "failure_and_rollback",
+                "observability",
+                "test_mapping",
+            }
+            for index, surface in enumerate(surfaces):
+                if not isinstance(surface, dict):
+                    raise PMError(f"{record_id}.implementation_surfaces[{index}] must be an object")
+                missing_surface_fields = sorted(surface_fields - set(surface))
+                if missing_surface_fields:
+                    raise PMError(
+                        f"{record_id}.implementation_surfaces[{index}] is missing: {', '.join(missing_surface_fields)}"
+                    )
+            decomposition = implementation["functional_decomposition"]
+            if not isinstance(decomposition, list) or not decomposition:
+                raise PMError(f"{record_id}.implementation_contract.functional_decomposition must be non-empty")
+            unit_fields = {"id", "title", "actor", "trigger", "preconditions", "inputs", "steps", "outputs", "state_transitions", "errors", "acceptance", "implementation_mapping"}
+            for index, unit in enumerate(decomposition):
+                if not isinstance(unit, dict) or unit_fields - set(unit):
+                    missing = sorted(unit_fields - set(unit)) if isinstance(unit, dict) else sorted(unit_fields)
+                    raise PMError(f"{record_id}.functional_decomposition[{index}] is missing: {', '.join(missing)}")
+                if any(unit.get(field) in (None, "", [], {}) for field in unit_fields):
+                    raise PMError(f"{record_id}.functional_decomposition[{index}] contains empty detail")
+            state_model = implementation["state_model"]
+            if not isinstance(state_model, list) or not state_model:
+                raise PMError(f"{record_id}.implementation_contract.state_model must be non-empty")
+            state_fields = {"state", "entry", "visible_behavior", "allowed_actions", "exit", "retention"}
+            for index, item in enumerate(state_model):
+                if not isinstance(item, dict) or state_fields - set(item):
+                    missing = sorted(state_fields - set(item)) if isinstance(item, dict) else sorted(state_fields)
+                    raise PMError(f"{record_id}.state_model[{index}] is missing: {', '.join(missing)}")
+            verification_matrix = implementation["verification_matrix"]
+            if not isinstance(verification_matrix, list) or not verification_matrix:
+                raise PMError(f"{record_id}.implementation_contract.verification_matrix must be non-empty")
+            verification_fields = {"id", "scenario", "expected", "method", "evidence_or_test"}
+            for index, item in enumerate(verification_matrix):
+                if not isinstance(item, dict) or verification_fields - set(item):
+                    missing = sorted(verification_fields - set(item)) if isinstance(item, dict) else sorted(verification_fields)
+                    raise PMError(f"{record_id}.verification_matrix[{index}] is missing: {', '.join(missing)}")
+            rounds = record["feature_shaping_rounds"].get("rounds")
+            if not isinstance(rounds, list) or len(rounds) != 5:
+                raise PMError(f"{record_id}.feature_shaping_rounds.rounds must contain all five rounds")
+            round_fields = {"round", "status", "questions", "conclusions", "evidence", "unresolved_items", "confirmation_source"}
+            if {item.get("round") for item in rounds if isinstance(item, dict)} != {1, 2, 3, 4, 5}:
+                raise PMError(f"{record_id}.feature_shaping_rounds must include rounds 1 through 5")
+            for index, item in enumerate(rounds):
+                if not isinstance(item, dict) or round_fields - set(item):
+                    missing = sorted(round_fields - set(item)) if isinstance(item, dict) else sorted(round_fields)
+                    raise PMError(f"{record_id}.feature_shaping_rounds.rounds[{index}] is missing: {', '.join(missing)}")
+                if item.get("status") not in {"complete", "confirmed"} or item.get("unresolved_items") not in (None, []):
+                    raise PMError(f"{record_id}.feature_shaping_rounds.rounds[{index}] is incomplete")
+            if not isinstance(implementation["decisions"], list):
+                raise PMError(f"{record_id}.implementation_contract.decisions must be a list")
+            if implementation["unresolved_items"] not in (None, []):
+                raise PMError(f"{record_id} has unresolved implementation items and cannot enter {record['readiness']}")
+            if not isinstance(record.get("acceptance_scenarios"), list) or not record.get("acceptance_scenarios"):
+                raise PMError(f"{record_id} requires acceptance_scenarios")
+            acceptance_fields = {"id", "given", "when", "then", "verification"}
+            for index, scenario in enumerate(record["acceptance_scenarios"]):
+                if not isinstance(scenario, dict) or acceptance_fields - set(scenario):
+                    missing = sorted(acceptance_fields - set(scenario)) if isinstance(scenario, dict) else sorted(acceptance_fields)
+                    raise PMError(f"{record_id}.acceptance_scenarios[{index}] is missing: {', '.join(missing)}")
+            if record.get("open_questions") not in (None, []):
+                raise PMError(f"{record_id} has open_questions and cannot enter {record['readiness']}")
+            if any(
+                question.get("status") in {"open", "deferred"}
+                for question in (record.get("decision_questions") or [])
+            ):
+                raise PMError(f"{record_id} has unresolved decision_questions and cannot enter {record['readiness']}")
+            gate = record.get("gate")
+            if gate.get("status") != "approved":
+                raise PMError(f"{record_id} requires an approved feature-shaping gate")
+            if not gate.get("confirmed_source"):
+                raise PMError(f"{record_id} requires gate.confirmed_source")
+            if gate.get("confirmation_protocol") != "explicit_scope_confirmation":
+                raise PMError(f"{record_id} requires explicit scope confirmation protocol")
+            if not str(gate.get("confirmed_scope_statement", "")).strip():
+                raise PMError(f"{record_id} requires a confirmed scope statement")
+            review_lenses = gate.get("review_lenses")
+            if not isinstance(review_lenses, list) or not review_lenses:
+                raise PMError(f"{record_id} gate.review_lenses must be a non-empty list")
+            lens_fields = {"name", "question", "conclusion", "evidence", "unresolved"}
+            for index, lens in enumerate(review_lenses):
+                if not isinstance(lens, dict):
+                    raise PMError(f"{record_id}.gate.review_lenses[{index}] must be an object")
+                missing_lens_fields = sorted(lens_fields - set(lens))
+                if missing_lens_fields:
+                    raise PMError(
+                        f"{record_id}.gate.review_lenses[{index}] is missing: {', '.join(missing_lens_fields)}"
+                    )
+                if lens.get("unresolved") not in (None, []):
+                    raise PMError(f"{record_id}.gate.review_lenses[{index}] has unresolved items")
     elif collection == "intake_items":
         if record.get("kind") not in INTAKE_KINDS:
             raise PMError(f"invalid intake kind for {record_id}")
@@ -300,6 +574,31 @@ def apply_operation(state: dict[str, Any], op: dict[str, Any], stamp: str) -> di
         state["project"]["updated_at"] = stamp
         return {"op": kind, "fields": sorted(patch)}
 
+    if kind == "unlock_confirmation":
+        collection = op.get("collection")
+        if collection != "requirements":
+            raise PMError("unlock_confirmation only supports requirements")
+        record_id = op.get("id")
+        record = get_record(state, collection, record_id)
+        if record.get("confirmation_lock", {}).get("status") != "locked":
+            raise PMError(f"{record_id} confirmation is not locked")
+        source_ref = op.get("source_ref")
+        reason = op.get("reason")
+        if not source_ref or not reason:
+            raise PMError("unlock_confirmation requires source_ref and reason")
+        get_record(state, "sources", source_ref)
+        old = record.get("status")
+        record.pop("confirmation_lock", None)
+        record["status"] = "pending_confirmation"
+        record["version"] = record.get("version", 1) + 1
+        record["updated_at"] = stamp
+        record.setdefault("status_history", []).append({
+            "from": old, "to": "pending_confirmation", "reason": reason,
+            "source_ref": source_ref, "timestamp": stamp,
+        })
+        validate_record(collection, record)
+        return {"op": kind, "collection": collection, "id": record_id, "version": record["version"]}
+
     collection = op.get("collection")
     if collection not in COLLECTIONS:
         raise PMError(f"{kind} requires a supported collection")
@@ -332,6 +631,13 @@ def apply_operation(state: dict[str, Any], op: dict[str, Any], stamp: str) -> di
         patch = op.get("patch")
         if not isinstance(patch, dict) or not patch:
             raise PMError("revise requires non-empty patch")
+        metadata_only = collection == "requirements" and set(patch).issubset({"code_mapping", "implementation_evidence", "source_map_status"})
+        if collection == "requirements" and record.get("confirmation_lock", {}).get("status") == "locked" and not metadata_only:
+            if set(op.get("patch", {})) & CONFIRMATION_PROTECTED_FIELDS:
+                raise PMError(
+                    f"{record_id} confirmation is locked; an explicit scope change request is required before changing: "
+                    + ", ".join(sorted(set(op.get("patch", {})) & CONFIRMATION_PROTECTED_FIELDS))
+                )
         forbidden = {"id", "version", "created_at", "updated_at"} & set(patch)
         if forbidden:
             raise PMError(f"revision cannot patch: {sorted(forbidden)}")
@@ -344,10 +650,13 @@ def apply_operation(state: dict[str, Any], op: dict[str, Any], stamp: str) -> di
         if "status" in patch and collection in ALLOWED_TRANSITIONS:
             raise PMError("use transition to change status")
         record.update(copy.deepcopy(patch))
-        record["version"] = record.get("version", 1) + 1
+        if not metadata_only:
+            record["version"] = record.get("version", 1) + 1
         record["updated_at"] = stamp
         validate_record(collection, record)
         if collection == "requirements" and op.get("change_class") != "wording_only":
+            if record.get("readiness") in BUILD_READINESS:
+                record["readiness"] = "ready_for_design"
             for evidence in state["evidence"]:
                 if record_id in evidence.get("related_ids", []):
                     evidence["status"] = "needs_review"
@@ -359,6 +668,8 @@ def apply_operation(state: dict[str, Any], op: dict[str, Any], stamp: str) -> di
         return {"op": kind, "collection": collection, "id": record_id, "version": record["version"]}
 
     if kind == "transition":
+        if collection == "requirements" and record.get("confirmation_lock", {}).get("status") == "locked":
+            raise PMError(f"{record_id} confirmation is locked; an explicit scope change request is required before transition")
         old = record.get("status")
         new = op.get("to")
         if new == old:
@@ -366,14 +677,14 @@ def apply_operation(state: dict[str, Any], op: dict[str, Any], stamp: str) -> di
         allowed = ALLOWED_TRANSITIONS.get(collection, {}).get(old, set())
         if new not in allowed:
             raise PMError(f"invalid transition for {record_id}: {old} -> {new}")
-        if collection == "requirements" and new in {"confirmed", "rejected", "superseded"}:
+        if collection == "requirements" and new in {"confirmed", "ai_confirmed_unverified", "pending_confirmation", "rejected", "superseded"}:
             if not op.get("source_ref") or not op.get("reason"):
                 raise PMError(f"transition to {new} requires source_ref and reason")
-            if new == "confirmed" and not record.get("acceptance_criteria"):
-                raise PMError(f"confirmed requirement {record_id} requires acceptance_criteria")
+            if new in {"confirmed", "ai_confirmed_unverified"} and not record.get("acceptance_criteria"):
+                raise PMError(f"{new} requirement {record_id} requires acceptance_criteria")
             get_record(state, "sources", op["source_ref"])
         record["status"] = new
-        if collection == "requirements" and new in {"confirmed", "rejected", "superseded"}:
+        if collection == "requirements" and new in {"confirmed", "ai_confirmed_unverified", "pending_confirmation", "rejected", "superseded"}:
             record.setdefault("status_history", []).append({
                 "from": old, "to": new, "reason": op["reason"], "source_ref": op["source_ref"], "timestamp": stamp
             })
@@ -381,6 +692,8 @@ def apply_operation(state: dict[str, Any], op: dict[str, Any], stamp: str) -> di
         return {"op": kind, "collection": collection, "id": record_id, "from": old, "to": new}
 
     if kind == "add_source_ref":
+        if collection == "requirements" and record.get("confirmation_lock", {}).get("status") == "locked":
+            raise PMError(f"{record_id} confirmation is locked; an explicit scope change request is required before adding sources")
         source_ref = op.get("source_ref")
         if not isinstance(source_ref, str) or not source_ref:
             raise PMError("add_source_ref requires source_ref")
@@ -473,6 +786,779 @@ def md(value: Any) -> str:
     return str(value).replace("|", "\\|").replace("\n", " ")
 
 
+def html_value(value: Any) -> str:
+    if value in (None, "", []):
+        return "—"
+    if isinstance(value, (list, dict)):
+        return json.dumps(value, ensure_ascii=False)
+    return str(value)
+
+
+def html_text(value: Any) -> str:
+    return html_escape(html_value(value), quote=True)
+
+
+def html_bullets(values: Any, empty: str = "—") -> str:
+    if not values:
+        return f'<span class="muted">{html_escape(empty)}</span>'
+    if not isinstance(values, list):
+        values = [values]
+    return "<ul>" + "".join(f"<li>{html_text(item)}</li>" for item in values) + "</ul>"
+
+
+def html_status_class(value: Any) -> str:
+    aliases = {
+        "可开发/验收": "ready",
+        "待回答": "attention",
+        "需求未确认": "attention",
+        "设计/实现未完成": "attention",
+        "确认待拓展": "confirmed-for-extension",
+        "AI已确认/待人工核验": "ai-confirmed-unverified",
+        "AI已确认/待人工核验·待回答": "ai-confirmed-unverified",
+    }
+    if str(value) in aliases:
+        return aliases[str(value)]
+    normalized = re.sub(r"[^a-z0-9_-]+", "-", str(value or "unknown").lower()).strip("-")
+    return normalized or "unknown"
+
+
+def render_action_card(action: dict[str, Any]) -> str:
+    missing = action.get("missing") or []
+    missing_html = f'<p class="missing">待补齐：{html_text("、".join(missing))}</p>' if missing else ""
+    criteria = action.get("acceptance_criteria") or []
+    if criteria:
+        acceptance_html = f'<details class="action-acceptance"><summary>验收标准（{len(criteria)} 条）</summary>{html_bullets(criteria)}</details>'
+    else:
+        acceptance_html = '<p class="missing">验收标准：待补充</p>'
+    return "".join([
+        f'<article class="action-card {html_status_class(action.get("status"))}">',
+        f'<div class="action-heading"><span class="badge">{html_text(action.get("id"))}</span>',
+        f'<span class="state {html_status_class(action.get("status"))}">{html_text(action.get("status"))}</span></div>',
+        f'<h3>{html_text(action.get("action"))}</h3>',
+        f'<div class="action-meta"><span><strong>负责人</strong>{html_text(action.get("owner") or "待指定")}</span>',
+        f'<span><strong>截止时间</strong>{html_text(action.get("due_at") or "待设置")}</span>',
+        f'<span><strong>关联功能</strong>{html_text(action.get("requirement_ids"))}</span></div>',
+        acceptance_html,
+        missing_html,
+        '</article>',
+    ])
+
+
+def render_daily_progress_row(day: dict[str, Any]) -> str:
+    progressed = html_bullets(day.get("progressed_items"), "没有可追踪的推进项")
+    completed = html_bullets(day.get("completed_items"), "无完成项")
+    blocked = html_bullets(day.get("blocked_items"), "无阻塞项")
+    product_changes = html_bullets(day.get("product_changes"), "没有识别到需求、决策或开发工作包的产品改动")
+    progress_delta = html_bullets(progress_delta_text(day), "没有明确的进度状态变化")
+    snapshot = day.get("current_snapshot") or {}
+    snapshot_text = (
+        f'需求确认 {html_text(snapshot.get("requirements_confirmed"))}/{html_text(snapshot.get("requirements_total"))}；'
+        f'构建门禁 {html_text(snapshot.get("build_ready"))}/{html_text(snapshot.get("requirements_total"))}；'
+        f'工作包完成 {html_text(snapshot.get("work_packages_done"))}/{html_text(snapshot.get("work_packages_total"))}'
+    )
+    sessions = html_text(day.get("session_ids")) if day.get("session_ids") else "无导入 session"
+    group_order = ["需求与功能", "开发工作包", "产品决策", "证据与来源", "里程碑", "风险", "评审", "项目设置", "Session"]
+    groups = day.get("change_groups") or {}
+    group_blocks = []
+    for group in group_order + [name for name in groups if name not in group_order]:
+        entries = groups.get(group) or []
+        if not entries:
+            continue
+        entry_rows = "".join(
+            f'<li><strong>{"r" + html_text(entry.get("revision")) if entry.get("revision") else html_text(entry.get("summary"))}</strong> '
+            f'{html_text(entry.get("detail"))} '
+            f'<span class="muted">来源：{html_text(entry.get("source_ref") or "未记录")}</span></li>'
+            for entry in entries
+        )
+        group_blocks.append(f'<section class="daily-group"><h4>{html_text(group)}（{len(entries)}）</h4><ul>{entry_rows}</ul></section>')
+    grouped_details = "".join(group_blocks) or '<p class="muted">没有具体修改明细</p>'
+    return "".join([
+        '<details class="daily-row">',
+        f'<summary><strong>{html_text(day.get("date"))}</strong> · '
+        f'工作量 {html_text(day.get("workload"))}（状态操作 {html_text(day.get("operations"))}，公开消息 {html_text(day.get("session_messages"))}）</summary>',
+        '<div class="daily-detail">',
+        f'<p class="daily-synthesis"><strong>项目经理提炼：</strong>{html_text(day.get("synthesis") or day.get("daily_summary"))}</p>',
+        f'<p class="daily-summary"><strong>量化进度：</strong>{html_text(day.get("daily_summary"))}</p>',
+        f'<p><strong>具体产品改动：</strong></p><div class="daily-product-changes">{product_changes}</div>',
+        f'<p><strong>进度提升：</strong>{progress_delta}</p>',
+        f'<p><strong>当前累计进度：</strong>{snapshot_text}</p>',
+        f'<p><strong>推进项目：</strong>{progressed}</p>',
+        f'<p><strong>完成：</strong>{completed}</p>',
+        f'<p><strong>阻塞：</strong>{blocked}</p>',
+        f'<p><strong>按类型的具体工作与修改：</strong></p><div class="daily-changes">{grouped_details}</div>',
+        f'<p class="muted"><strong>Session：</strong>{sessions}</p>',
+        '</div></details>',
+    ])
+
+
+def requirement_overview(req: dict[str, Any]) -> tuple[str, list[str]]:
+    questions: list[str] = []
+    for question in req.get("decision_questions") or []:
+        if question.get("status") in {"open", "deferred"}:
+            questions.append(f"{question.get('id', 'DQ')}：{question.get('question', '')}")
+    questions.extend(str(item) for item in req.get("open_questions") or [])
+    if req.get("status") == "ai_confirmed_unverified":
+        if questions:
+            return "AI已确认/待人工核验·待回答", questions
+        return "AI已确认/待人工核验", questions
+    if req.get("status") != "confirmed":
+        return "需求未确认", questions
+    if questions:
+        return "待回答", questions
+    if req.get("readiness") == "confirmed_for_extension":
+        return "确认待拓展", questions
+    if req.get("readiness") not in BUILD_READINESS:
+        return "设计/实现未完成", questions
+    return "可开发/验收", questions
+
+
+def compact_text(value: Any, limit: int = 220) -> str:
+    text = " ".join(str(value or "").split())
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def local_day_key(timestamp_value: Any, timezone_name: str) -> str | None:
+    if not timestamp_value:
+        return None
+    raw = str(timestamp_value)
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        try:
+            parsed = parsed.astimezone(ZoneInfo(timezone_name))
+        except ZoneInfoNotFoundError:
+            pass
+        return parsed.date().isoformat()
+    except ValueError:
+        match = re.match(r"^(\d{4}-\d{2}-\d{2})", raw)
+        return match.group(1) if match else None
+
+
+def read_session_archives(root: Path, timezone_name: str = "UTC") -> list[dict[str, Any]]:
+    conv_dir = root / LOCAL_REL / "conversations"
+    if not conv_dir.exists():
+        return []
+    archives: list[dict[str, Any]] = []
+    for path in sorted(conv_dir.glob("*.jsonl"), key=lambda item: item.stat().st_mtime, reverse=True):
+        messages: list[dict[str, Any]] = []
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            try:
+                item = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            role = item.get("role")
+            if role not in {"user", "assistant"}:
+                continue
+            content = item.get("content") or item.get("text") or ""
+            messages.append({
+                "role": role,
+                "content": compact_text(content),
+                "timestamp": item.get("timestamp"),
+            })
+        if not messages:
+            continue
+        daily: dict[str, dict[str, Any]] = {}
+        for message in messages:
+            day = local_day_key(message.get("timestamp"), timezone_name)
+            if not day:
+                continue
+            bucket = daily.setdefault(day, {
+                "date": day,
+                "messages": 0,
+                "user_messages": 0,
+                "assistant_messages": 0,
+                "first_message": None,
+                "last_message": None,
+            })
+            bucket["messages"] += 1
+            bucket[f'{message["role"]}_messages'] += 1
+            bucket["first_message"] = bucket["first_message"] or message
+            bucket["last_message"] = message
+        archives.append({
+            "session_id": path.stem,
+            "path": str(path.relative_to(root)).replace("\\", "/"),
+            "message_count": len(messages),
+            "user_messages": sum(item["role"] == "user" for item in messages),
+            "assistant_messages": sum(item["role"] == "assistant" for item in messages),
+            "first_message": messages[0],
+            "last_message": messages[-1],
+            "daily_activity": [daily[day] for day in sorted(daily, reverse=True)],
+        })
+    return archives
+
+
+def state_record_label(state: dict[str, Any], collection: Any, record_id: Any) -> str:
+    if not record_id:
+        return ""
+    records = state.get(str(collection), []) if collection else []
+    record = next((item for item in records if item.get("id") == record_id), None)
+    title = record.get("title") if record else None
+    return f"{record_id} · {title}" if title else str(record_id)
+
+
+def describe_state_operation(state: dict[str, Any], operation: dict[str, Any]) -> str:
+    kind = operation.get("op")
+    collection = operation.get("collection")
+    record_id = operation.get("id")
+    label = state_record_label(state, collection, record_id)
+    if kind == "transition":
+        return f"状态变更：{label} · {operation.get('from')} → {operation.get('to')}"
+    if kind == "revise":
+        fields = operation.get("fields") or []
+        version = operation.get("version")
+        suffix = f"；字段：{', '.join(str(field) for field in fields)}" if fields else ""
+        if version:
+            suffix += f"；版本 v{version}"
+        return f"修改：{label}{suffix}"
+    if kind == "add":
+        return f"新增：{label or (str(collection) if collection else '项目记录')}"
+    if kind == "add_source_ref":
+        return f"补充来源：{label} · {operation.get('source_ref')}"
+    if kind == "import_session":
+        return f"导入 session：新增 {operation.get('messages_added', 0)} 条公开消息"
+    if kind == "set_project":
+        return f"修改项目字段：{', '.join(str(field) for field in operation.get('fields') or [])}"
+    return f"{kind or '操作'}：{label or collection or '项目'}"
+
+
+def daily_group_name(operation: dict[str, Any]) -> str:
+    if operation.get("op") == "import_session":
+        return "Session"
+    collection = operation.get("collection")
+    return {
+        "requirements": "需求与功能",
+        "scenarios": "需求与功能",
+        "intake_items": "需求与功能",
+        "work_packages": "开发工作包",
+        "milestones": "里程碑",
+        "decisions": "产品决策",
+        "sources": "证据与来源",
+        "evidence": "证据与来源",
+        "risks": "风险",
+        "reviews": "评审",
+    }.get(collection, "项目设置")
+
+
+def current_progress_snapshot(state: dict[str, Any]) -> dict[str, Any]:
+    requirements = state.get("requirements", [])
+    work_packages = [item for item in state.get("work_packages", []) if item.get("status") != "cancelled"]
+    return {
+        "requirements_total": len(requirements),
+        "requirements_confirmed": sum(item.get("status") in {"confirmed", "ai_confirmed_unverified"} for item in requirements),
+        "requirements_ai_unverified": sum(item.get("status") == "ai_confirmed_unverified" for item in requirements),
+        "build_ready": sum(item.get("readiness") in BUILD_READINESS for item in requirements),
+        "work_packages_total": len(work_packages),
+        "work_packages_done": sum(item.get("status") == "done" for item in work_packages),
+        "work_packages_in_progress": sum(item.get("status") == "in_progress" for item in work_packages),
+        "work_packages_blocked": sum(item.get("status") == "blocked" for item in work_packages),
+    }
+
+
+def progress_delta_text(item: dict[str, Any]) -> list[str]:
+    delta = item.get("progress_delta") or {}
+    labels = {
+        "requirements_confirmed": "确认需求",
+        "requirements_readiness_changed": "更新需求就绪状态",
+        "requirements_design_updated": "补充产品/实现设计",
+        "work_packages_added": "新增开发工作包",
+        "work_packages_started": "启动开发工作包",
+        "work_packages_completed": "完成开发工作包",
+        "work_packages_blocked": "阻塞开发工作包",
+        "decisions_added": "新增产品决策",
+        "milestones_changed": "推进里程碑",
+        "risks_changed": "更新风险",
+    }
+    rows = []
+    for key, label in labels.items():
+        values = delta.get(key) or []
+        if values:
+            examples = "、".join(values[:3])
+            suffix = f" 等 {len(values)} 项" if len(values) > 3 else ""
+            rows.append(f"{label} {len(values)} 项（{examples}{suffix}）")
+    if delta.get("evidence_added"):
+        rows.append(f"补充证据/来源 {len(delta['evidence_added'])} 项")
+    return rows
+
+
+def daily_summary_text(item: dict[str, Any]) -> str:
+    parts = progress_delta_text(item)
+    if not parts:
+        parts.append(f"记录 {item.get('operations', 0)} 次结构化操作，但没有识别出明确的产品进度状态变化")
+    if item.get("session_messages"):
+        parts.append(f"处理 {item['session_messages']} 条公开 session 消息")
+    snapshot = item.get("current_snapshot") or {}
+    parts.append(
+        "当前累计进度：需求确认 "
+        f"{snapshot.get('requirements_confirmed', 0)}/{snapshot.get('requirements_total', 0)}，"
+        "达到构建门禁 "
+        f"{snapshot.get('build_ready', 0)}/{snapshot.get('requirements_total', 0)}，"
+        "工作包完成 "
+        f"{snapshot.get('work_packages_done', 0)}/{snapshot.get('work_packages_total', 0)}"
+    )
+    return "；".join(parts) + "。"
+
+
+def daily_synthesis_text(item: dict[str, Any]) -> str:
+    """把当天的结构化变更提炼成项目经理可读的工作结论。
+
+    这段文字故意不复述每条操作，而是把操作合并成「推进主题 → 具体动作 → 当前影响」
+    三层信息；完整明细仍保留在下方按类型展开的清单中。
+    """
+    delta = item.get("progress_delta") or {}
+    themes: list[str] = []
+    if delta.get("requirements_confirmed") or delta.get("requirements_design_updated"):
+        themes.append("需求定稿与产品/实现设计细化")
+    if delta.get("work_packages_added") or delta.get("work_packages_started") or delta.get("work_packages_completed"):
+        themes.append("开发拆解与纵向交付验证")
+    if delta.get("decisions_added"):
+        themes.append("产品决策固化")
+    if delta.get("milestones_changed"):
+        themes.append("里程碑推进")
+    if delta.get("evidence_added"):
+        themes.append("证据与来源补齐")
+    if delta.get("risks_changed"):
+        themes.append("风险处理")
+    if not themes and item.get("session_messages"):
+        themes.append("工作记录整理")
+
+    clauses: list[str] = []
+    if delta.get("requirements_confirmed"):
+        clauses.append(f"确认了 {len(delta['requirements_confirmed'])} 项需求")
+    if delta.get("requirements_design_updated"):
+        clauses.append(f"补齐了 {len(delta['requirements_design_updated'])} 项需求的行为、边界、验收或实现契约")
+    if delta.get("work_packages_added"):
+        clauses.append(f"把需求拆成 {len(delta['work_packages_added'])} 个开发工作包")
+    if delta.get("work_packages_completed"):
+        clauses.append(f"完成 {len(delta['work_packages_completed'])} 个工作包并形成验证结果")
+    if delta.get("decisions_added"):
+        clauses.append(f"沉淀 {len(delta['decisions_added'])} 项产品决策，减少后续实现歧义")
+    if delta.get("milestones_changed"):
+        clauses.append(f"推进 {len(delta['milestones_changed'])} 个里程碑")
+    if delta.get("evidence_added"):
+        clauses.append(f"补充 {len(delta['evidence_added'])} 项证据或来源")
+
+    # 从事件摘要中提取少量有语义的结论，用来回答“到底改了什么”。
+    summaries = []
+    for summary in item.get("change_summaries") or []:
+        text = compact_text(summary, 100)
+        if not text or text.lower() in {"structured update", "状态更新"}:
+            continue
+        if text not in summaries:
+            summaries.append(text)
+    evidence = ""
+    if summaries:
+        evidence = "代表性结论包括：" + "；".join(summaries[:3]) + "。"
+
+    snapshot = item.get("current_snapshot") or {}
+    progress_change = (
+        f"本日新增确认 {len(delta.get('requirements_confirmed') or [])} 项需求、"
+        f"新增达到构建门禁 {len(delta.get('requirements_readiness_changed') or [])} 项、"
+        f"完成 {len(delta.get('work_packages_completed') or [])} 个工作包"
+    )
+    impact = (
+        f"进度变化：{progress_change}；当前累计为需求确认 {snapshot.get('requirements_confirmed', 0)}/{snapshot.get('requirements_total', 0)}，"
+        f"构建门禁 {snapshot.get('build_ready', 0)}/{snapshot.get('requirements_total', 0)}，"
+        f"工作包完成 {snapshot.get('work_packages_done', 0)}/{snapshot.get('work_packages_total', 0)}"
+    )
+    remaining = (
+        f"仍有 {max(snapshot.get('requirements_total', 0) - snapshot.get('requirements_confirmed', 0), 0)} 项需求待确认、"
+        f"{max(snapshot.get('requirements_total', 0) - snapshot.get('build_ready', 0), 0)} 项需求未达到构建门禁"
+    )
+    if not clauses:
+        clauses.append(f"整理了 {item.get('operations', 0)} 次结构化变更")
+    lead = "今天主要推进" + "、".join(themes) + "：" if themes else "今天主要完成："
+    return lead + "，".join(clauses) + "。" + (evidence + " ") + impact + "；" + remaining + "。"
+
+
+def build_daily_progress(state: dict[str, Any], session_archives: list[dict[str, Any]], limit: int = 30) -> list[dict[str, Any]]:
+    timezone_name = state.get("project", {}).get("timezone") or "UTC"
+    by_day: dict[str, dict[str, Any]] = {}
+
+    def bucket_for(day: str) -> dict[str, Any]:
+        return by_day.setdefault(day, {
+            "date": day,
+            "state_changes": 0,
+            "operations": 0,
+            "session_messages": 0,
+            "session_ids": [],
+            "progressed_items": [],
+            "completed_items": [],
+            "blocked_items": [],
+            "change_summaries": [],
+            "change_details": [],
+            "change_groups": {},
+            "product_changes": [],
+            "progress_delta": {
+                "requirements_confirmed": [],
+                "requirements_readiness_changed": [],
+                "requirements_design_updated": [],
+                "work_packages_added": [],
+                "work_packages_started": [],
+                "work_packages_completed": [],
+                "work_packages_blocked": [],
+                "decisions_added": [],
+                "milestones_changed": [],
+                "risks_changed": [],
+                "evidence_added": [],
+            },
+            "current_snapshot": current_progress_snapshot(state),
+            "synthesis": "",
+        })
+
+    def add_unique(values: list[str], value: Any) -> None:
+        if value and value not in values:
+            values.append(str(value))
+
+    for event in state.get("change_events", []):
+        day = local_day_key(event.get("timestamp"), timezone_name)
+        if not day:
+            continue
+        bucket = bucket_for(day)
+        bucket["state_changes"] += 1
+        operations = event.get("operations") or []
+        bucket["operations"] += len(operations)
+        summary = compact_text(event.get("summary"), 180)
+        if summary:
+            bucket["change_summaries"].append(summary)
+        bucket["change_details"].append({
+            "revision": event.get("revision"),
+            "timestamp": event.get("timestamp"),
+            "summary": summary,
+            "source_ref": event.get("source_ref"),
+            "operations": [describe_state_operation(state, operation) for operation in operations],
+        })
+        if not operations:
+            bucket["change_groups"].setdefault("项目设置", []).append({
+                "revision": event.get("revision"),
+                "summary": summary,
+                "source_ref": event.get("source_ref"),
+                "detail": "记录了一次项目状态更新，但没有可展开的结构化操作。",
+            })
+        for operation in operations:
+            collection = operation.get("collection")
+            record_id = operation.get("id")
+            label = state_record_label(state, collection, record_id) or record_id
+            detail = describe_state_operation(state, operation)
+            if collection in {"requirements", "work_packages", "milestones", "decisions", "risks", "reviews"}:
+                add_unique(bucket["product_changes"], detail)
+            group = daily_group_name(operation)
+            bucket["change_groups"].setdefault(group, []).append({
+                "revision": event.get("revision"),
+                "summary": summary,
+                "source_ref": event.get("source_ref"),
+                "detail": detail,
+            })
+            delta = bucket["progress_delta"]
+            kind = operation.get("op")
+            if kind == "add" and collection == "requirements":
+                add_unique(delta["requirements_design_updated"], label)
+            if kind == "add" and collection == "work_packages":
+                add_unique(delta["work_packages_added"], label)
+            if kind == "add" and collection == "decisions":
+                add_unique(delta["decisions_added"], label)
+            if kind == "add" and collection in {"sources", "evidence"}:
+                add_unique(delta["evidence_added"], label)
+            if kind == "transition":
+                if collection == "requirements" and operation.get("to") == "confirmed":
+                    add_unique(delta["requirements_confirmed"], label)
+                if collection == "work_packages" and operation.get("to") == "in_progress":
+                    add_unique(delta["work_packages_started"], label)
+                if collection == "work_packages" and operation.get("to") == "done":
+                    add_unique(delta["work_packages_completed"], label)
+                if collection == "work_packages" and operation.get("to") == "blocked":
+                    add_unique(delta["work_packages_blocked"], label)
+                if collection == "milestones":
+                    add_unique(delta["milestones_changed"], label)
+                if collection == "risks":
+                    add_unique(delta["risks_changed"], label)
+            if kind == "revise" and collection == "requirements":
+                fields = set(operation.get("fields") or [])
+                if "readiness" in fields:
+                    add_unique(delta["requirements_readiness_changed"], label)
+                if fields & {"behavior", "boundaries", "acceptance_criteria", "technical_design", "implementation_contract", "decision_questions"}:
+                    add_unique(delta["requirements_design_updated"], label)
+            if collection in {"requirements", "work_packages", "milestones", "risks", "reviews"}:
+                add_unique(bucket["progressed_items"], label)
+            if operation.get("to") == "done" or (collection == "work_packages" and operation.get("to") == "reached"):
+                add_unique(bucket["completed_items"], label)
+            if operation.get("to") == "blocked":
+                add_unique(bucket["blocked_items"], label)
+
+    for archive in session_archives:
+        for activity in archive.get("daily_activity") or []:
+            day = activity.get("date")
+            if not day:
+                continue
+            bucket = bucket_for(day)
+            bucket["session_messages"] += activity.get("messages", 0)
+            add_unique(bucket["session_ids"], archive.get("session_id"))
+            bucket["change_groups"].setdefault("Session", []).append({
+                "revision": None,
+                "summary": archive.get("session_id"),
+                "source_ref": archive.get("path"),
+                "detail": f"公开消息 {activity.get('messages', 0)} 条（用户 {activity.get('user_messages', 0)}，助手 {activity.get('assistant_messages', 0)}）",
+            })
+
+    daily = []
+    for day in sorted(by_day, reverse=True)[:limit]:
+        item = by_day[day]
+        item["workload"] = item["operations"] + item["session_messages"]
+        item["change_summaries"] = item["change_summaries"][:8]
+        item["change_details"] = item["change_details"][-50:]
+        item["daily_summary"] = daily_summary_text(item)
+        item["synthesis"] = daily_synthesis_text(item)
+        daily.append(item)
+    return daily
+
+
+def build_progress_summary(root: Path, state: dict[str, Any]) -> dict[str, Any]:
+    requirements = state["requirements"]
+    work_packages = state["work_packages"]
+    project = state.get("project", {})
+    requirements_by_id = {req.get("id"): req for req in requirements}
+    pending_requirements = [
+        {"id": req["id"], "title": req.get("title"), "status": req.get("status"), "readiness": req.get("readiness")}
+        for req in requirements
+        if req.get("status") in {"candidate", "clarification_needed", "pending_confirmation"}
+        or requirement_overview(req)[0] in {"待回答", "设计/实现未完成"}
+    ]
+    next_actions: list[dict[str, Any]] = []
+    for item in work_packages:
+        if item.get("status") not in {"in_progress", "blocked", "not_started"}:
+            continue
+        requirement_ids = item.get("requirement_ids") or []
+        linked_requirements = [requirements_by_id[rid] for rid in requirement_ids if rid in requirements_by_id]
+        acceptance = item.get("acceptance_criteria") or [
+            criterion
+            for req in linked_requirements
+            for criterion in (req.get("acceptance_criteria") or [])
+        ]
+        owner = item.get("owner") or project.get("owner")
+        due_at = item.get("due_at") or item.get("target_date")
+        missing = []
+        if not owner or owner == "unknown":
+            missing.append("负责人")
+        if not due_at:
+            missing.append("截止时间")
+        if not acceptance:
+            missing.append("验收标准")
+        next_actions.append({
+            "id": item.get("id"),
+            "action": item.get("next_action") or f"推进工作包：{item.get('title')}",
+            "status": item.get("status"),
+            "owner": owner,
+            "due_at": due_at,
+            "acceptance_criteria": acceptance,
+            "requirement_ids": requirement_ids,
+            "source": "work_package",
+            "missing": missing,
+        })
+    active_work_requirement_ids = {
+        rid for item in next_actions for rid in item.get("requirement_ids") or []
+    }
+    for req in requirements:
+        label, _ = requirement_overview(req)
+        if label == "可开发/验收" or req.get("id") in active_work_requirement_ids:
+            continue
+        if req.get("status") not in {"candidate", "clarification_needed", "pending_confirmation", "confirmed"}:
+            continue
+        owner = req.get("owner") or project.get("owner")
+        due_at = req.get("due_at") or req.get("target_date")
+        missing = []
+        if not owner or owner == "unknown":
+            missing.append("负责人")
+        if not due_at:
+            missing.append("截止时间")
+        if not req.get("acceptance_criteria"):
+            missing.append("验收标准")
+        next_actions.append({
+            "id": f"{req.get('id')}-DESIGN",
+            "action": f"完成 {req.get('id')} · {req.get('title')} 的功能定档与开发门禁",
+            "status": "blocked" if req.get("status") != "confirmed" else "not_started",
+            "owner": owner,
+            "due_at": due_at,
+            "acceptance_criteria": req.get("acceptance_criteria") or [],
+            "requirement_ids": [req.get("id")],
+            "source": "requirement_gate",
+            "missing": missing,
+        })
+    session_archives = read_session_archives(root, project.get("timezone") or "UTC")
+    return {
+        "revision": state.get("revision"),
+        "stage": state.get("project", {}).get("stage"),
+        "active_mode": state.get("project", {}).get("active_mode"),
+        "completed_work": [
+            {"id": item["id"], "title": item.get("title"), "status": item.get("status")}
+            for item in work_packages if item.get("status") == "done"
+        ],
+        "in_progress_work": [
+            {"id": item["id"], "title": item.get("title"), "status": item.get("status"), "requirement_ids": item.get("requirement_ids")}
+            for item in work_packages if item.get("status") in {"in_progress", "blocked", "not_started"}
+        ],
+        "pending_requirements": pending_requirements,
+        "next_actions": next_actions,
+        "open_risks": [
+            {"id": risk["id"], "title": risk.get("title"), "status": risk.get("status"), "impact": risk.get("impact"), "response": risk.get("response")}
+            for risk in state["risks"] if risk.get("status") != "closed"
+        ],
+        "recent_changes": state.get("change_events", [])[-8:],
+        "session_archives": session_archives,
+        "daily_progress": build_daily_progress(state, session_archives),
+    }
+
+
+def render_project_overview(root: Path, state: dict[str, Any]) -> None:
+    docs = root / DOCS_REL
+    project = state["project"]
+    requirements = state["requirements"]
+    work_packages = state["work_packages"]
+    milestones = state["milestones"]
+    risks = state["risks"]
+    reviews = state["reviews"]
+    confirmed = sum(req.get("status") in {"confirmed", "ai_confirmed_unverified"} for req in requirements)
+    ai_unverified = sum(req.get("status") == "ai_confirmed_unverified" for req in requirements)
+    build_ready = sum(req.get("readiness") in BUILD_READINESS for req in requirements)
+    extension_ready = sum(req.get("readiness") == "confirmed_for_extension" for req in requirements)
+    undecided = []
+    for req in requirements:
+        label, questions = requirement_overview(req)
+        if label != "可开发/验收":
+            undecided.append((req, label, questions))
+    done_work = sum(item.get("status") == "done" for item in work_packages)
+    generated = now_iso()
+    progress = build_progress_summary(root, state)
+
+    feature_rows: list[str] = []
+    feature_cards: list[str] = []
+    for req in requirements:
+        label, questions = requirement_overview(req)
+        req_id = str(req.get("id", "REQ"))
+        anchor = html_status_class(req_id)
+        search = html_escape(" ".join(str(req.get(key, "")) for key in ("id", "title", "status", "readiness", "behavior")), quote=True)
+        feature_rows.append(
+            f'<tr data-search="{search}" data-state="{html_status_class(label)}">'
+            f'<td><a href="#{anchor}">{html_text(req_id)}</a></td>'
+            f'<td>{html_text(req.get("title"))}</td>'
+            f'<td><span class="badge {html_status_class(req.get("status"))}">{html_text(req.get("status"))}</span></td>'
+            f'<td><span class="badge {html_status_class(req.get("readiness"))}">{html_text(req.get("readiness"))}</span></td>'
+            f'<td><span class="state {html_status_class(label)}">{html_text(label)}</span></td>'
+            f'<td>{html_text(req.get("priority"))}</td></tr>'
+        )
+        implementation = req.get("implementation_contract") or {}
+        surfaces = implementation.get("implementation_surfaces") or []
+        surface_blocks = []
+        for surface in surfaces:
+            surface_blocks.append(
+                "<article class=\"surface\">"
+                f"<h4>{html_text(surface.get('name'))}</h4>"
+                f"<p><strong>当前结构：</strong>{html_text(surface.get('current_structure'))}</p>"
+                f"<p><strong>本次决定：</strong>{html_text(surface.get('decision'))}</p>"
+                f"<p><strong>接口/数据：</strong>{html_text(surface.get('interfaces_or_data'))}</p>"
+                f"<p><strong>执行步骤：</strong>{html_bullets(surface.get('execution_steps'))}</p>"
+                f"<p><strong>失败与回滚：</strong>{html_text(surface.get('failure_and_rollback'))}</p>"
+                f"<p><strong>观测与测试：</strong>{html_text(surface.get('observability'))}；{html_text(surface.get('test_mapping'))}</p>"
+                f"<p><strong>任务：</strong>{html_text(surface.get('task_mapping'))}</p>"
+                "</article>"
+            )
+        question_html = html_bullets(questions, "没有未决问题")
+        surface_html = "".join(surface_blocks) if surface_blocks else '<p class="muted">尚未形成动态实现面清单。</p>'
+        feature_cards.append(
+            f'<section class="feature-card" id="{anchor}" data-search="{search}">'
+            f'<div class="feature-heading"><h3>{html_text(req_id)} · {html_text(req.get("title"))}</h3>'
+            f'<span class="state {html_status_class(label)}">{html_text(label)}</span></div>'
+            f'<div class="meta"><span>需求状态：{html_text(req.get("status"))}</span><span>就绪度：{html_text(req.get("readiness"))}</span><span>优先级：{html_text(req.get("priority"))}</span><span>版本：v{html_text(req.get("version", 1))}</span></div>'
+            f'<p class="clamp-2"><strong>可观察行为：</strong>{html_text(req.get("behavior"))}</p>'
+            f'<details class="feature-definition"><summary>产品定义、未决问题与验收</summary>'
+            f'<p><strong>用户价值：</strong>{html_text(req.get("user_value"))}</p>'
+            f'<p><strong>边界：</strong>{html_text(req.get("boundaries"))}</p>'
+            f'<div class="two-col"><div><h4>未决问题</h4>{question_html}</div>'
+            f'<div><h4>验收条件</h4>{html_bullets(req.get("acceptance_criteria"))}</div></div></details>'
+            f'<details><summary>实现思路与开发契约</summary>'
+            f'<p><strong>技术方案：</strong>{html_text((req.get("technical_design") or {}).get("stack"))}</p>'
+            f'<p><strong>实现决策：</strong>{html_bullets(implementation.get("decisions"))}</p>'
+            f'{surface_html}'
+            f'<p><strong>原子功能单元：</strong>{html_bullets([unit.get("id", "") + "：" + str(unit.get("title", "")) for unit in implementation.get("functional_decomposition") or []])}</p>'
+            f'<p><strong>状态模型：</strong>{html_bullets([item.get("state", "") for item in implementation.get("state_model") or []])}</p>'
+            f'<p><strong>验证矩阵：</strong>{html_bullets([item.get("id", "") + "：" + str(item.get("scenario", "")) for item in implementation.get("verification_matrix") or []])}</p>'
+            "</details></section>"
+        )
+
+    undecided_html = html_bullets([
+        f"{req.get('id')} · {req.get('title')}：{label}"
+        for req, label, _ in undecided
+    ], "当前没有待敲定功能")
+    work_rows = "".join(
+        f"<tr><td>{html_text(item.get('id'))}</td><td>{html_text(item.get('title'))}</td>"
+        f"<td><span class=\"badge {html_status_class(item.get('status'))}\">{html_text(item.get('status'))}</span></td>"
+        f"<td>{html_text(item.get('requirement_ids'))}</td><td>{html_text(item.get('due_at') or item.get('target_date'))}</td></tr>"
+        for item in work_packages
+    ) or '<tr><td colspan="5" class="muted">尚无工作包</td></tr>'
+    milestone_rows = "".join(
+        f"<li><strong>{html_text(item.get('id'))}</strong> {html_text(item.get('title'))} · {html_text(item.get('status'))} · {html_text(item.get('due_at') or item.get('target_date'))}</li>"
+        for item in milestones
+    ) or '<li class="muted">尚无里程碑</li>'
+    risk_rows = "".join(
+        f"<li><strong>{html_text(item.get('id'))}</strong> {html_text(item.get('title'))} · {html_text(item.get('status'))}<br><span class=\"muted\">{html_text(item.get('impact'))}</span></li>"
+        for item in risks
+    ) or '<li class="muted">尚无风险</li>'
+    review_rows = "".join(
+        f"<li><strong>{html_text(item.get('id'))}</strong> {html_text(item.get('title'))} · {html_text(item.get('kind'))}<br><span class=\"muted\">建议：{html_text(item.get('recommendation'))}</span></li>"
+        for item in reviews
+    ) or '<li class="muted">尚无评审项</li>'
+
+    change_rows = "".join(
+        f'<li><strong>r{html_text(event.get("revision"))}</strong> {html_text(event.get("summary"))} · {html_text(event.get("timestamp"))}'
+        f'<br><span class="muted">操作：{html_text([op.get("id", op.get("op", "")) for op in event.get("operations") or []])}</span></li>'
+        for event in progress["recent_changes"]
+    ) or '<li class="muted">尚无状态变更记录</li>'
+    archive_rows = "".join(
+        f'<li><strong>{html_text(archive.get("session_id"))}</strong> · {html_text(archive.get("message_count"))} 条公开消息'
+        f'<br><span class="muted">首条：{html_text((archive.get("first_message") or {}).get("content"))}</span>'
+        f'<br><span class="muted">末条：{html_text((archive.get("last_message") or {}).get("content"))}</span></li>'
+        for archive in progress["session_archives"][:5]
+    ) or '<li class="muted">当前没有已导入的 session 归档；本页根据 state.json 的状态变更生成工作摘要。</li>'
+    completed_rows = html_bullets([f'{item.get("id")} · {item.get("title")}' for item in progress["completed_work"]], "本轮没有标记为完成的工作包")
+    in_progress_rows = html_bullets([f'{item.get("id")} · {item.get("title")} · {item.get("status")}' for item in progress["in_progress_work"]], "没有活动工作包")
+    pending_rows = html_bullets([f'{item.get("id")} · {item.get("title")} · {item.get("readiness")}' for item in progress["pending_requirements"]], "没有待处理需求")
+    action_cards = "".join(render_action_card(action) for action in progress["next_actions"]) or '<p class="muted">当前没有活动下一步行动。</p>'
+    daily_rows = "".join(render_daily_progress_row(day) for day in progress["daily_progress"]) or '<p class="muted">当前没有可按天汇总的状态变更或 session 活动。</p>'
+
+    page = f'''<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{html_text(project.get("name"))} · 项目进度概览</title>
+<style>
+:root {{ color-scheme: light; --ink:#172033; --muted:#667085; --line:#e5e7eb; --panel:#fff; --bg:#f5f7fb; --accent:#315efb; --warn:#b54708; --good:#13795b; }}
+* {{ box-sizing:border-box; }} body {{ margin:0; font:14px/1.6 Inter,"Segoe UI","Microsoft YaHei",sans-serif; color:var(--ink); background:var(--bg); }}
+a {{ color:var(--accent); text-decoration:none; }} a:hover {{ text-decoration:underline; }} .wrap {{ max-width:1440px; margin:0 auto; padding:28px; }}
+header {{ display:flex; justify-content:space-between; gap:20px; align-items:flex-start; margin-bottom:22px; }} h1,h2,h3,h4 {{ margin:0 0 8px; line-height:1.25; }} h1 {{ font-size:30px; }} h2 {{ margin-top:28px; font-size:20px; }} h3 {{ font-size:17px; }} h4 {{ font-size:14px; }}
+.muted {{ color:var(--muted); }} .stamp {{ color:var(--muted); font-size:12px; text-align:right; }} .panel,.feature-card {{ background:var(--panel); border:1px solid var(--line); border-radius:14px; box-shadow:0 3px 12px #1b2a4510; }}
+.panel {{ padding:18px; }} .hero {{ display:grid; grid-template-columns:1.5fr 1fr; gap:16px; }} .overview {{ white-space:pre-wrap; }} .scope {{ display:grid; grid-template-columns:1fr 1fr; gap:14px; }}
+.metrics {{ display:grid; grid-template-columns:repeat(4,1fr); gap:12px; margin:16px 0; }} .metric {{ padding:14px; border:1px solid var(--line); border-radius:12px; background:#fbfcff; }} .metric strong {{ display:block; font-size:25px; }} .metric span {{ color:var(--muted); }}
+.attention {{ border-left:4px solid var(--warn); }} .action-board {{ border:2px solid var(--warn); background:#fffaf2; }} .action-grid {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(320px,1fr)); gap:14px; }} .action-card {{ background:#fff; border:1px solid #fed7aa; border-left:5px solid var(--warn); border-radius:12px; padding:14px; }} .action-card.in-progress {{ border-left-color:var(--accent); }} .action-card.done {{ border-left-color:var(--good); }} .action-heading {{ display:flex; justify-content:space-between; gap:10px; align-items:center; }} .action-card h3 {{ margin-top:10px; }} .action-meta {{ display:flex; flex-wrap:wrap; gap:8px 16px; color:var(--muted); font-size:12px; margin-bottom:10px; }} .action-meta strong {{ color:var(--ink); margin-right:4px; }} .action-acceptance {{ margin-top:10px; }} .missing {{ margin:10px 0 0; padding:8px 10px; border-radius:8px; color:var(--warn); background:#fff7ed; font-size:12px; }} .table-wrap {{ overflow:auto; }} table {{ width:100%; border-collapse:collapse; min-width:760px; }} th,td {{ padding:10px 9px; border-bottom:1px solid var(--line); text-align:left; vertical-align:top; }} th {{ color:var(--muted); font-weight:600; font-size:12px; }}
+.badge,.state {{ display:inline-block; border-radius:999px; padding:2px 8px; font-size:12px; border:1px solid var(--line); background:#f8fafc; white-space:nowrap; }} .state.ready,.state.ready-for-build,.state.ready-for-acceptance,.confirmed {{ color:var(--good); background:#ecfdf3; border-color:#bbf7d0; }} .state.confirmed-for-extension,.confirmed_for_extension {{ color:#1d4ed8; background:#eff6ff; border-color:#bfdbfe; }} .state.attention,.pending-confirmation,.not-ready,.ready-for-design {{ color:var(--warn); background:#fff7ed; border-color:#fed7aa; }}
+.feature-list {{ display:grid; gap:14px; margin-top:14px; }} .feature-card {{ padding:18px; }} .feature-heading {{ display:flex; justify-content:space-between; gap:12px; align-items:center; }} .meta {{ display:flex; flex-wrap:wrap; gap:8px 16px; color:var(--muted); font-size:12px; margin-bottom:10px; }} .two-col {{ display:grid; grid-template-columns:1fr 1fr; gap:18px; }} .clamp-2 {{ display:-webkit-box; -webkit-box-orient:vertical; -webkit-line-clamp:2; overflow:hidden; }}
+details {{ margin-top:14px; border-top:1px solid var(--line); padding-top:12px; }} summary {{ cursor:pointer; font-weight:650; }} .feature-definition {{ margin-top:8px; }} .surface {{ margin:10px 0; padding:12px; border:1px solid var(--line); border-radius:10px; background:#fbfcff; }} ul {{ margin:6px 0 0 20px; padding:0; }} li {{ margin:3px 0; }} .toolbar {{ display:flex; gap:10px; margin:12px 0; }} input {{ flex:1; padding:10px 12px; border:1px solid var(--line); border-radius:9px; font:inherit; }} .daily-board {{ border-left:4px solid var(--accent); }} .daily-row {{ margin:8px 0; padding:8px 0; border-bottom:1px solid var(--line); }} .daily-row summary {{ font-weight:600; }} .daily-detail {{ max-height:420px; overflow:auto; padding:8px 4px 2px 16px; }} .daily-synthesis {{ margin:0 0 12px; padding:12px 14px; background:#e8f1ff; border:1px solid #b8d2ff; border-radius:8px; line-height:1.65; }} .daily-summary {{ margin:0 0 12px; padding:10px 12px; background:#f5f8fc; border-radius:8px; color:#405064; }} .daily-product-changes {{ max-height:300px; overflow:auto; padding:8px 10px; background:#fff; border:1px solid var(--line); border-radius:8px; }} .daily-changes {{ max-height:300px; overflow:auto; padding:8px 10px; background:#fbfcff; border:1px solid var(--line); border-radius:8px; }} .daily-group {{ margin:0 0 12px; padding:8px 10px; border-left:3px solid var(--accent); background:#fff; }} .daily-group h4 {{ margin-bottom:4px; }}
+footer {{ margin-top:28px; color:var(--muted); font-size:12px; }} @media(max-width:900px) {{ .hero,.two-col,.scope {{ grid-template-columns:1fr; }} .metrics {{ grid-template-columns:repeat(2,1fr); }} header {{ display:block; }} .stamp {{ text-align:left; margin-top:8px; }} }} @media print {{ body {{ background:#fff; }} .panel,.feature-card {{ box-shadow:none; }} .toolbar {{ display:none; }} }}
+</style></head><body><main class="wrap">
+<header><div><h1>{html_text(project.get("name"))}</h1><p class="muted">项目进度概览 · 静态页面 · 由 project-manager 自动生成</p></div><div class="stamp">revision {html_text(state.get('revision'))}<br>生成于 {html_text(generated)}<br>来源：state.json</div></header>
+<section class="hero"><div class="panel"><h2>产品概述</h2><p class="overview">{html_text(project.get("goal"))}</p><div class="scope"><div><h4>预期结果</h4>{html_bullets(project.get("success_outcomes"))}</div><div><h4>当前范围</h4>{html_bullets(project.get("in_scope"))}</div></div></div><div class="panel attention"><h2>当前需要关注</h2>{undecided_html}<p class="muted">此列表优先提示需求未确认、仍有未决问题或尚未完成完整设计契约的功能。</p></div></section>
+<section class="metrics"><div class="metric"><strong>{len(requirements)}</strong><span>功能需求</span></div><div class="metric"><strong>{confirmed}</strong><span>需求已确认（含 AI）</span></div><div class="metric"><strong>{ai_unverified}</strong><span>AI确认待人工核验</span></div><div class="metric"><strong>{build_ready}</strong><span>已达到构建门禁</span></div><div class="metric"><strong>{extension_ready}</strong><span>确认待拓展</span></div><div class="metric"><strong>{len(undecided)}</strong><span>仍需敲定</span></div></section>
+<section class="panel action-board"><h2>下一步行动 · PM Action Board</h2><p class="muted">每项行动都必须明确负责人、截止时间和可验收结果；显示“待指定 / 待设置 / 待补充”的项目需要先补齐治理信息。</p><div class="action-grid">{action_cards}</div></section>
+<section class="panel daily-board"><h2>每日进度汇总</h2><p class="muted">按项目时区从当前目录的结构化状态变更和已导入公开 session 归档聚合；点击日期展开当天摘要、具体产品改动和进度提升。当天详情按需求/功能、开发工作包、产品决策、证据来源、里程碑、风险评审和 Session 分类，不按时间流水展示。摘要同时给出当前累计进度，区分“今天做了什么”和“项目现在走到哪里”。</p>{daily_rows}</section>
+<section class="panel"><h2>本轮 / Session 工作汇报</h2><div class="two-col"><div><h3>已完成</h3>{completed_rows}<h3>进行中与下一步</h3>{in_progress_rows}</div><div><h3>待敲定或阻塞</h3>{pending_rows}<h3>最近状态变化</h3><ul>{change_rows}</ul></div></div><details><summary>Session 归档摘要</summary><ul>{archive_rows}</ul></details><p class="muted">摘要来源：当前 revision 的状态变更、工作包、需求门禁、风险和已导入的公开 session 归档。它不把隐藏推理或工具输出写入项目状态。</p></section>
+<section class="panel"><h2>功能列表与敲定状态</h2><div class="toolbar"><input id="featureFilter" placeholder="搜索功能、状态、行为或需求 ID" aria-label="搜索功能"></div><div class="table-wrap"><table><thead><tr><th>ID</th><th>功能</th><th>需求状态</th><th>就绪度</th><th>当前判断</th><th>优先级</th></tr></thead><tbody id="featureRows">{"".join(feature_rows) or '<tr><td colspan="6" class="muted">尚无正式需求</td></tr>'}</tbody></table></div></section>
+<section class="feature-list">{"".join(feature_cards) or '<div class="panel muted">尚无功能详情</div>'}</section>
+<section class="panel"><h2>开发工作与项目运行情况</h2><div class="table-wrap"><table><thead><tr><th>ID</th><th>工作包</th><th>状态</th><th>关联功能</th><th>日期</th></tr></thead><tbody>{work_rows}</tbody></table></div><div class="two-col"><div><h3>里程碑</h3><ul>{milestone_rows}</ul></div><div><h3>风险与评审</h3><ul>{risk_rows}{review_rows}</ul></div></div></section>
+<footer>本页不是实时服务；它是由 project-manager 根据当前项目状态生成的静态概览。运行 `pm.py apply`、`init` 或 `index` 后会自动刷新。</footer>
+</main><script>const input=document.getElementById('featureFilter'); input?.addEventListener('input',()=>{{const q=input.value.trim().toLowerCase(); document.querySelectorAll('#featureRows tr[data-search],.feature-card[data-search]').forEach(el=>{{el.hidden=q && !el.dataset.search.toLowerCase().includes(q);}});}});</script></body></html>'''
+    atomic_text(docs / PROJECT_OVERVIEW_NAME, page)
+
+
 def render_views(root: Path, state: dict[str, Any]) -> None:
     docs = root / DOCS_REL
     p = state["project"]
@@ -487,6 +1573,9 @@ def render_views(root: Path, state: dict[str, Any]) -> None:
         f"- 状态 revision：`{state['revision']}`", "",
         "## 文档", "",
         "- [需求基线](REQUIREMENTS.md)",
+        "- [待拓展模块索引](EXTENSION-MODULES.md)",
+        "- [模块交互手册](MODULE-INTERACTIONS.md)",
+        f"- [项目进度概览]({PROJECT_OVERVIEW_NAME})",
         "- [交付与日期](DELIVERY.md)",
         "- [决定与产品评审](DECISIONS.md)",
         "- [结构化状态](state.json)", "",
@@ -567,10 +1656,77 @@ def render_views(root: Path, state: dict[str, Any]) -> None:
     if not state["reviews"]:
         decisions.append("| — | — | 尚无评审项 | — | — | — |")
 
+    extension_lines = [
+        "# 待拓展模块索引", "",
+        "> 由 `pm.py` 根据需求的 `confirmed_for_extension` 状态和拓展模块字段自动生成；确认入口仍在当前对话。", "",
+        "| 模块 | 需求 | 状态 | 当前保留的接口/设计 | 工作包 |",
+        "|---|---|---|---|---|",
+    ]
+    extension_requirements = [
+        req for req in state["requirements"]
+        if req.get("readiness") == "confirmed_for_extension"
+        or req.get("extension_module_id")
+        or req.get("related_extension_module_ids")
+    ]
+    for req in extension_requirements:
+        module_ids = req.get("extension_module_id") or req.get("related_extension_module_ids") or "未分配"
+        module_title = req.get("extension_module_title") or req.get("related_extension_module_title") or "关联拓展模块"
+        contract = req.get("extension_contract") or req.get("extension_contract_summary") or req.get("extension_integration_note") or "待补充"
+        contract_text = "；".join(f"{key}: {value}" for key, value in contract.items()) if isinstance(contract, dict) else compact_text(contract, 360)
+        work_package_ids = req.get("work_package_ids") or req.get("work_package_id") or "待建立"
+        status = req.get("readiness") if req.get("extension_module_id") or req.get("readiness") == "confirmed_for_extension" else f"关联接入点（{req.get('readiness')}）"
+        extension_lines.append(
+            f"| {md(module_ids)} · {md(module_title)} | {md(req.get('id'))} {md(req.get('title'))} | "
+            f"{md(status)} | {md(compact_text(contract_text, 360))} | {md(work_package_ids)} |"
+        )
+    if not extension_requirements:
+        extension_lines.append("| — | 尚无确认待拓展需求 | — | — | — |")
+
+    interaction_lines = [
+        "# 模块交互手册", "",
+        "> 由 `pm.py` 根据需求的模块归属、关联需求和交互契约自动生成；耦合模块必须先补齐接口规范。", "",
+        "| 源模块 | 目标模块/需求 | 耦合级别 | 交互与数据边界 | 接口规范状态 |",
+        "|---|---|---|---|---|",
+    ]
+    interaction_count = 0
+    requirements_by_id = {req.get("id"): req for req in state["requirements"]}
+    for req in state["requirements"]:
+        source_module = req.get("module_id") or req.get("module_title")
+        related_ids = req.get("related_requirement_ids") or []
+        contracts = req.get("interaction_contracts") or []
+        if isinstance(contracts, dict):
+            contracts = [contracts]
+        if not source_module and not related_ids and not contracts:
+            continue
+        source_label = f"{source_module} · {req.get('module_title') or req.get('title')}" if source_module else req.get("id")
+        targets = related_ids or ["待补充目标"]
+        for target_id in targets:
+            target = requirements_by_id.get(target_id)
+            target_label = f"{target_id} · {target.get('title')}" if target else str(target_id)
+            contract_text = "；".join(
+                f"{item.get('name') or item.get('interface') or '契约'}: {item.get('behavior') or item.get('contract') or item}"
+                if isinstance(item, dict) else str(item) for item in contracts
+            ) or req.get("extension_integration_note") or req.get("interaction_note") or "待补充"
+            interface_spec = req.get("interface_spec") or {}
+            if isinstance(interface_spec, dict):
+                interface_status = interface_spec.get("status") or ("已定义" if interface_spec else "待补充")
+            else:
+                interface_status = str(interface_spec)
+            interaction_lines.append(
+                f"| {md(source_label)} | {md(target_label)} | {md(req.get('coupling_level') or '待判断')} | "
+                f"{md(compact_text(contract_text, 360))} | {md(interface_status)} |"
+            )
+            interaction_count += 1
+    if not interaction_count:
+        interaction_lines.append("| — | 尚无显式模块交互记录 | — | 对共享数据、状态、服务或跨需求行为进行耦合审查后再补充 | — |")
+
     atomic_text(docs / "INDEX.md", "\n".join(index) + "\n")
+    atomic_text(docs / "EXTENSION-MODULES.md", "\n".join(extension_lines) + "\n")
+    atomic_text(docs / "MODULE-INTERACTIONS.md", "\n".join(interaction_lines) + "\n")
     atomic_text(docs / "REQUIREMENTS.md", "\n".join(req_lines) + "\n")
     atomic_text(docs / "DELIVERY.md", "\n".join(delivery) + "\n")
     atomic_text(docs / "DECISIONS.md", "\n".join(decisions) + "\n")
+    render_project_overview(root, state)
 
 
 def build_search_index(root: Path, state: dict[str, Any]) -> dict[str, Any]:
@@ -754,7 +1910,7 @@ def cmd_check(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
             errors.append({"code": "INVALID_DEADLINE", **row})
         elif row["alert"] in {"overdue", "due_soon"}:
             warnings.append({"code": row["alert"].upper(), **row})
-    confirmed = [r for r in state["requirements"] if r.get("status") == "confirmed"]
+    confirmed = [r for r in state["requirements"] if r.get("status") in {"confirmed", "ai_confirmed_unverified"}]
     linked = {rid for wp in state["work_packages"] for rid in wp.get("requirement_ids", [])}
     for req in confirmed:
         if req["id"] not in linked:
@@ -776,17 +1932,38 @@ def cmd_resume(args: argparse.Namespace) -> dict[str, Any]:
     state = load_state(args.project_root)
     active_reqs = [r for r in state["requirements"] if r.get("status") not in {"rejected", "superseded"}]
     pending = [r for r in active_reqs if r.get("status") in {"clarification_needed", "pending_confirmation"}]
+    decision_questions = []
+    legacy_open_questions = []
+    for requirement in active_reqs:
+        for question in requirement.get("decision_questions") or []:
+            if question.get("status") in {"open", "deferred"}:
+                decision_questions.append({
+                    "requirement_id": requirement["id"],
+                    "requirement_version": requirement.get("version"),
+                    **{key: question.get(key) for key in (
+                        "id", "question", "recommendation", "alternatives", "status", "source_ref", "asked_at"
+                    )},
+                })
+        if requirement.get("open_questions"):
+            legacy_open_questions.append({
+                "requirement_id": requirement["id"],
+                "requirement_version": requirement.get("version"),
+                "questions": requirement["open_questions"],
+            })
     active_work = [w for w in state["work_packages"] if w.get("status") not in {"done", "cancelled"}]
     open_risks = [r for r in state["risks"] if r.get("status") not in {"closed"}]
     return {
         "project": state["project"],
         "revision": state["revision"],
-        "requirements": {"active": len(active_reqs), "confirmed": sum(r.get("status") == "confirmed" for r in active_reqs)},
+        "requirements": {"active": len(active_reqs), "confirmed": sum(r.get("status") in {"confirmed", "ai_confirmed_unverified"} for r in active_reqs), "ai_confirmed_unverified": sum(r.get("status") == "ai_confirmed_unverified" for r in active_reqs)},
         "pending_confirmation": [{"id": r["id"], "title": r.get("title"), "status": r.get("status")} for r in pending[:10]],
+        "decision_questions": decision_questions[:50],
+        "legacy_open_questions": legacy_open_questions[:50],
         "active_work": [{"id": w["id"], "title": w.get("title"), "status": w.get("status")} for w in active_work[:10]],
         "open_risks": [{"id": r["id"], "title": r.get("title"), "status": r.get("status")} for r in open_risks[:10]],
         "deadline_alerts": [r for r in deadline_rows(state, args.hours) if r["alert"] != "scheduled"],
         "last_changes": state.get("change_events", [])[-5:],
+        "progress_summary": build_progress_summary(args.project_root, state),
     }
 
 
