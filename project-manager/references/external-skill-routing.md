@@ -8,6 +8,7 @@
 
 | 当前需要 | 可路由能力 | 路由前提 | 返回后必须做什么 |
 |---|---|---|---|
+| 将需求规格转成工程包，并按需继续实现、验证和审计 | project-development | 产包可先输出阻塞草稿；完整开发要求 confirmed 或 ai_confirmed_unverified 且 ready_for_build，AI 确认保留未人工核验标记；已提供目标仓库 | 根据用户选择只生成工程包，或同时按工作包实现并验证；回写代码映射、工作包与证据引用，不自行修改产品范围 |
 | 需要可编辑的产品草图、页面形态或设计系统中的界面 | `figma-generate-design`，同时加载 `figma-use` | 有 Figma 文件/目标页面，或用户明确要 Figma 交付物 | 记录页面/节点引用、关键取舍和与需求版本的对应关系；检查图是否覆盖主流程和异常状态 |
 | 已有 Figma 设计，需要写入项目代码 | `figma-implement-design` | 有 Figma URL/节点或 Figma desktop 选择；项目能接入 Figma MCP | 将实现偏差、组件复用、响应式和可访问性结果写回实现契约与验收证据 |
 | 需要验证真实本地 Web 应用的页面和交互 | `webapp-testing` | 有可启动的本地 Web 应用 | 记录运行环境、路径、操作、截图/日志、通过条件和失败复现方式 |
@@ -29,6 +30,12 @@
 - 希望外置 skill 产出的具体交付物。
 - 不允许外置 skill 自行决定的范围、数据、权限和用户行为。
 
+路由到 project-development 时，同时提供 project-to-act 文档根目录/账本模式、当前 docs 索引位置、相关 WP ID，以及是否要求“只生成工程包”或“工程包并继续实现”。工程包由开发 skill 保存在 project-development 文档区；项目账本只更新简短状态和路径/证据引用。
+
+确认回答、需求封闭或版本变化后，当前版本工程包缺失/过期就自动触发工程包模式，不等待用户另行说出 skill 名称。输入不全时先做可独立完成的调查并输出 draft/blocked 草稿。项目经理负责继续补齐产品材料并回收结果，不能在两项 skill 间只来回转交阻塞说明。执行 [交接与缺口处置](handoff-and-recovery.md)，产品编码仍按既有授权与 ready_for_build 门禁进行。
+
+纯实现元数据回写按 project-development 治理集成指南检查实际 pm.py 行为；revise 使用 change_class=wording_only、有效 source_ref 和 reason，patch 限于允许的映射/证据/所有权元数据。既有实现面缺失工程字段的有限增补按 [交接与缺口处置](handoff-and-recovery.md) 执行；不得改变既有契约值或借该分类修改产品语义。
+
 没有这些信息时，先继续产品定档或探索，不把模糊需求直接交给设计/前端 skill。
 
 ### 2. 路由中约束
@@ -46,6 +53,7 @@
 - 区分“视觉/代码/测试产物存在”和“产品能力已经验收通过”。
 - 如果产物暴露新问题，新增评审项或探索任务；如果改变已确认行为，需求版本升级并让 `ready_for_build` 回退。
 - 只有项目经理重新检查产品、体验、技术、实现和验收闭环后，才能恢复开发门禁。
+- project-development 返回后，核对工程包是否引用正确 REQ 版本、WP、基线提交和证据；按 project-manager 状态写入规则更新允许的 code_mapping、implementation_evidence、source_map_status 和 WP/EVD 记录。若返回结果要求改变产品行为或受保护契约，先走需求版本变更，不把开发结论直接写为用户确认。
 
 ## 绘图和前端的推荐组合
 

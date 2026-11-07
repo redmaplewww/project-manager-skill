@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import importlib.util
 import json
 import tempfile
@@ -161,7 +162,7 @@ class ProjectManagerTests(unittest.TestCase):
             }
         )
         summary = pm.build_progress_summary(self.root, pm.load_state(self.root))
-        action = summary["next_actions"][0]
+        action = next(a for a in summary["next_actions"] if a["id"] == "WP-001")
         self.assertEqual(action["id"], "WP-001")
         self.assertEqual(action["owner"], "项目开发者")
         self.assertEqual(action["due_at"], "2026-10-20")
@@ -519,6 +520,23 @@ class ProjectManagerTests(unittest.TestCase):
                         "collection": "requirements",
                         "id": "REQ-001",
                         "expected_version": 2,
+                        "patch": {"confirmation_lock": {
+                            "status": "locked",
+                            "locked_version": 3,
+                            "locked_source_ref": "SRC-001",
+                            "locked_at": "2026-10-11T00:00:00Z",
+                            "reason": "冻结确认范围",
+                            "reopen_policy": "only_explicit_scope_change_request",
+                        }},
+                        "reason": "冻结已确认产品范围",
+                        "source_ref": "SRC-001",
+                        "change_class": "wording_only",
+                    },
+                    {
+                        "op": "revise",
+                        "collection": "requirements",
+                        "id": "REQ-001",
+                        "expected_version": 3,
                         "patch": {"readiness": "ready_for_build"},
                         "reason": "feature gate approved",
                         "source_ref": "SRC-001",
@@ -529,25 +547,98 @@ class ProjectManagerTests(unittest.TestCase):
         )
         state = pm.load_state(self.root)
         self.assertEqual(state["requirements"][0]["readiness"], "ready_for_build")
-        self.apply(
-            {
+        self.assertEqual(state["requirements"][0]["version"], 3)
+        ai_probe = copy.deepcopy(state["requirements"][0])
+        ai_probe.pop("confirmation_lock", None)
+        ai_probe.update(status="ai_confirmed_unverified", human_verification="unverified",
+                        code_mapping=[{"file": "app.py", "behavior": "实际入口映射"}])
+        ai_probe["gate"]["confirmation_protocol"] = "ai_review_unverified"
+        pm.validate_record("requirements", ai_probe)
+        ai_probe["status"] = "confirmed"
+        with self.assertRaisesRegex(pm.PMError, "explicit scope confirmation protocol"):
+            pm.validate_record("requirements", ai_probe)
+        with self.assertRaises(pm.PMError):
+            self.apply({
                 "expected_revision": 2,
-                "operations": [
-                    {
-                        "op": "revise",
-                        "collection": "requirements",
-                        "id": "REQ-001",
-                        "expected_version": 3,
-                        "patch": {"behavior": "updated behavior"},
-                        "reason": "new product behavior",
-                        "source_ref": "SRC-001",
-                        "change_class": "addition",
-                    }
-                ],
-            }
-        )
+                "operations": [{
+                    "op": "revise",
+                    "collection": "requirements",
+                    "id": "REQ-001",
+                    "expected_version": 3,
+                    "patch": {"behavior": "updated behavior"},
+                    "reason": "new product behavior",
+                    "source_ref": "SRC-001",
+                    "change_class": "addition",
+                }],
+            })
+        with self.assertRaisesRegex(pm.PMError, "readiness=ready_for_build"):
+            self.apply({
+                "expected_revision": 2,
+                "operations": [{
+                    "op": "revise",
+                    "collection": "requirements",
+                    "id": "REQ-001",
+                    "expected_version": 3,
+                    "patch": {"readiness": "ready_for_acceptance"},
+                    "reason": "未经实施验收的推进",
+                    "source_ref": "SRC-001",
+                    "change_class": "wording_only",
+                }],
+            })
+        locked = pm.load_state(self.root)["requirements"][0]
+        changed_gate = dict(locked["gate"], confirmed_scope_statement="扩大后的产品范围")
+        with self.assertRaisesRegex(pm.PMError, "confirmed_scope_statement is protected"):
+            self.apply({
+                "expected_revision": 2,
+                "operations": [{
+                    "op": "revise",
+                    "collection": "requirements",
+                    "id": "REQ-001",
+                    "expected_version": 3,
+                    "patch": {"gate": changed_gate},
+                    "reason": "尝试修改已确认范围",
+                    "source_ref": "SRC-001",
+                    "change_class": "wording_only",
+                }],
+            })
+        changed_gate_status = dict(locked["gate"], status="rejected")
+        with self.assertRaisesRegex(pm.PMError, "gate.status is protected"):
+            self.apply({
+                "expected_revision": 2,
+                "operations": [{
+                    "op": "revise",
+                    "collection": "requirements",
+                    "id": "REQ-001",
+                    "expected_version": 3,
+                    "patch": {"gate": changed_gate_status},
+                    "reason": "尝试重开已锁定门禁",
+                    "source_ref": "SRC-001",
+                    "change_class": "wording_only",
+                }],
+            })
         state = pm.load_state(self.root)
-        self.assertEqual(state["requirements"][0]["readiness"], "ready_for_design")
+        self.assertEqual(state["requirements"][0]["readiness"], "ready_for_build")
+        self.assertEqual(state["requirements"][0]["version"], 3)
+
+        # Engineering preparation does not require implementation/test results first.
+        self.apply({"expected_revision": 2, "operations": [{"op": "add", "collection": "work_packages", "record": {
+            "id": "WP-001", "title": "实现提交", "kind": "implementation", "status": "not_started",
+            "requirement_ids": ["REQ-001"], "next_action": "实现已确认的保存接口",
+        }}]})
+        state = pm.load_state(self.root)
+        self.make_package(state, version=3)
+        report = pm.delivery_diagnostics(self.root, state)
+        self.assertTrue(report["requirements"][0]["can_start_full_build"])
+        self.assertEqual(report["requirements"][0]["verification"], "not_assessed")
+        # Completing an independent gate can advance metadata without unlocking scope.
+        probe = copy.deepcopy(state)
+        probe["requirements"][0]["gate"]["status"] = "confirmed_locked"
+        probe["requirements"][0]["readiness"] = "ready_for_design"
+        pm.apply_operation(probe, {"op": "revise", "collection": "requirements", "id": "REQ-001", "expected_version": 3,
+                                  "reason": "independent engineering review", "source_ref": "SRC-001", "change_class": "wording_only",
+                                  "patch": {"gate": state["requirements"][0]["gate"], "readiness": "ready_for_build"}}, pm.now_iso())
+        self.assertEqual(probe["requirements"][0]["version"], 3)
+        self.assertEqual(probe["requirements"][0]["gate"]["status"], "approved")
 
     def test_shallow_feature_package_is_rejected(self) -> None:
         self.seed_requirement()
@@ -668,6 +759,37 @@ class ProjectManagerTests(unittest.TestCase):
         state = pm.load_state(self.root)
         self.assertEqual(state["requirements"][0]["status"], "pending_confirmation")
         self.assertNotIn("confirmation_lock", state["requirements"][0])
+
+    def test_unlock_archives_version_bound_package_without_new_confirmation_claim(self) -> None:
+        self.seed_requirement()
+        question = {
+            "id": "DQ-001", "question": "保留撤销吗？", "current_conclusion": "需要决定恢复边界",
+            "recommendation": "保留最近一次撤销", "alternatives": ["不提供撤销"],
+            "basis": "已有用户路径", "behavior_impact": "可撤销最近操作", "implementation_impact": "记录历史",
+            "acceptance_impact": "恢复一致", "status": "accepted", "answer": "保留", "source_ref": "SRC-001",
+            "requirement_version": 2, "asked_at": "2026-11-01T00:00:00Z",
+        }
+        package = {"requirement_id": "REQ-001", "requirement_version": 2,
+            "protocol": "per_question_with_recommendations", "presented_in_conversation": True,
+            "bulk_accept_phrase": "按本 REQ 推荐全部采纳", "questions": [question]}
+        self.apply({"expected_revision": 1, "operations": [{"op": "revise", "collection": "requirements", "id": "REQ-001",
+            "expected_version": 1, "patch": {"confirmation_package": package, "confirmation_lock": {
+                "status": "locked", "locked_version": 2, "locked_source_ref": "SRC-001", "locked_at": "2026-11-01T00:00:00Z",
+                "reason": "已确认旧范围", "reopen_policy": "only_explicit_scope_change_request"}},
+            "reason": "保存旧版本的确认材料", "source_ref": "SRC-001", "change_class": "correction"}]})
+        change = {"expected_revision": 2, "operations": [{"op": "unlock_confirmation", "collection": "requirements",
+            "id": "REQ-001", "source_ref": "SRC-001", "reason": "用户明确扩大实施范围"}]}
+        before = pm.state_path(self.root).read_bytes()
+        self.apply(change, dry_run=True)
+        self.assertEqual(before, pm.state_path(self.root).read_bytes())
+        self.apply(change)
+        req = pm.load_state(self.root)["requirements"][0]
+        self.assertEqual(req["version"], 3)
+        self.assertEqual(req["status"], "pending_confirmation")
+        self.assertEqual(req["readiness"], "ready_for_design")
+        self.assertNotIn("confirmation_package", req)
+        self.assertEqual(req["confirmation_history"][-1]["artifacts"]["confirmation_package"], package)
+        self.assertEqual(req["confirmation_history"][-1]["artifacts"]["confirmation_lock"]["locked_version"], 2)
 
     def test_deadline_uses_project_timezone_and_surfaces_overdue(self) -> None:
         self.apply(
@@ -822,6 +944,139 @@ class ProjectManagerTests(unittest.TestCase):
             }
         )
         self.assertEqual(pm.load_state(self.root)["risks"][0]["status"], "closed")
+
+
+    def confirmed_snapshot(self) -> dict:
+        self.seed_requirement()
+        state = pm.load_state(self.root)
+        state["requirements"][0]["status"] = "confirmed"
+        return state
+
+    def make_package(self, state: dict, version: int = 1, draft: bool = False) -> Path:
+        docs = pm.engineering_docs_root(self.root)
+        folder = docs / "project-development" / "packages" / "REQ-001" / f"v{version}"
+        folder.mkdir(parents=True, exist_ok=True)
+        package = folder / "ENGINEERING-PACKAGE.md"
+        package.write_text(f"# REQ-001 v{version}\n" + ("<!-- pm:package-draft -->\n" if draft else "工程设计与执行契约\n"), encoding="utf-8")
+        (folder / "INDEX.md").write_text("[工程包](ENGINEERING-PACKAGE.md)", encoding="utf-8")
+        (docs / "project-development" / "INDEX.md").write_text(f"[工程包](packages/REQ-001/v{version}/ENGINEERING-PACKAGE.md)", encoding="utf-8")
+        (docs / "README.md").write_text("[开发区](project-development/INDEX.md)", encoding="utf-8")
+        return package
+
+    def test_doctor_finds_missing_and_outdated_packages_without_mutation(self) -> None:
+        state = self.confirmed_snapshot()
+        before = json.dumps(state, sort_keys=True)
+        disk_before = pm.state_path(self.root).read_bytes()
+        report = pm.delivery_diagnostics(self.root, state)
+        self.assertIn("ENGINEERING_PACKAGE_MISSING", [f["code"] for f in report["findings"]])
+        self.make_package(state, version=1)
+        state["requirements"][0]["version"] = 2
+        report = pm.delivery_diagnostics(self.root, state)
+        self.assertIn("ENGINEERING_PACKAGE_STALE", [f["code"] for f in report["findings"]])
+        state["requirements"][0]["version"] = 1
+        self.assertEqual(json.dumps(state, sort_keys=True), before)
+        self.assertEqual(pm.state_path(self.root).read_bytes(), disk_before)
+
+    def test_cancelled_and_broad_governance_work_do_not_satisfy_handoff(self) -> None:
+        state = self.confirmed_snapshot()
+        state["work_packages"] = [
+            {"id": "WP-OLD", "title": "旧任务", "status": "cancelled", "requirement_ids": ["REQ-001"]},
+            {"id": "WP-ALL", "title": "通用治理", "status": "in_progress", "requirement_ids": ["REQ-001", "REQ-002"]},
+        ]
+        report = pm.delivery_diagnostics(self.root, state)
+        self.assertIn("CONFIRMED_WITHOUT_WORK_PACKAGE", [f["code"] for f in report["findings"]])
+        state["work_packages"][1]["kind"] = "implementation"
+        report = pm.delivery_diagnostics(self.root, state)
+        self.assertNotIn("CONFIRMED_WITHOUT_WORK_PACKAGE", [f["code"] for f in report["findings"]])
+
+    def test_missing_design_is_ai_work_and_existing_closure_is_preserved(self) -> None:
+        self.seed_requirement()
+        state = pm.load_state(self.root)
+        state["requirements"][0]["closure_attempt"] = {"source_ref": "SRC-001"}
+        report = pm.delivery_diagnostics(self.root, state)
+        self.assertTrue(report["requirements"][0]["closure_signal_received"])
+        self.assertEqual(report["user_decision_ids"], [])
+        shape = next(f for f in report["findings"] if f["code"] == "FEATURE_SHAPING_INCOMPLETE")
+        self.assertIn("implementation_contract", shape["missing_fields"])
+        self.assertFalse(shape["needs_user_decision"])
+        self.assertTrue(shape["steps"] and shape["acceptance_criteria"] and shape["target"])
+
+    def test_scope_filter_and_stage_checks_do_not_report_global_delivery_success(self) -> None:
+        self.seed_requirement()
+        structure, code = pm.cmd_check(argparse.Namespace(project_root=self.root, strict=True, stage="structure", requirement=["REQ-001"]))
+        self.assertEqual(code, 0)
+        engineering, code = pm.cmd_check(argparse.Namespace(project_root=self.root, strict=True, stage="engineering", requirement=["REQ-001"]))
+        self.assertEqual(code, 1)
+        self.assertTrue(engineering["structure_valid"])
+        self.assertEqual(engineering["stage_results"]["verification"], "not_assessed")
+        self.assertEqual(engineering["stage_results"]["acceptance"], "not_assessed")
+        with self.assertRaises(pm.PMError):
+            pm.delivery_diagnostics(self.root, pm.load_state(self.root), ["REQ-DOES-NOT-EXIST"])
+
+    def test_draft_and_missing_index_do_not_count_as_ready_packages(self) -> None:
+        state = self.confirmed_snapshot()
+        package = self.make_package(state, draft=True)
+        (package.parent / "INDEX.md").unlink()
+        report = pm.delivery_diagnostics(self.root, state)
+        codes = {f["code"] for f in report["findings"]}
+        self.assertTrue({"ENGINEERING_PACKAGE_DRAFT", "ENGINEERING_INDEX_INCOMPLETE"}.issubset(codes))
+        self.assertFalse(report["requirements"][0]["can_start_full_build"])
+
+    def test_custom_docs_root_and_ignored_superseded_requirement(self) -> None:
+        state = self.confirmed_snapshot()
+        config = self.root / ".project-to-act" / "PROJECT_CONFIG.json"
+        config.write_text(json.dumps({"schema_version": 2, "mode": "managed", "canonical_docs_root": "project-docs"}), encoding="utf-8")
+        package = self.make_package(state)
+        report = pm.delivery_diagnostics(self.root, state)
+        self.assertEqual(report["requirements"][0]["package_path"], str(package))
+        self.assertNotIn("ENGINEERING_PACKAGE_MISSING", [f["code"] for f in report["findings"]])
+        state["requirements"][0]["status"] = "superseded"
+        self.assertEqual(pm.delivery_diagnostics(self.root, state)["requirements"], [])
+
+    def test_filtered_report_write_preserves_full_project_and_state(self) -> None:
+        self.seed_requirement()
+        self.apply({"expected_revision": 1, "operations": [{"op": "add", "collection": "requirements", "record": {
+            "id": "REQ-002", "title": "另一项需求", "source_refs": ["SRC-001"], "status": "pending_confirmation",
+        }}]})
+        before = pm.state_path(self.root).read_bytes()
+        report = pm.cmd_doctor(argparse.Namespace(project_root=self.root, requirement=["REQ-001"], write_report=True))
+        self.assertEqual([r["id"] for r in report["requirements"]], ["REQ-001"])
+        saved = Path(report["report_path"]).read_text(encoding="utf-8")
+        self.assertIn("REQ-002", saved)
+        self.assertEqual(pm.state_path(self.root).read_bytes(), before)
+
+    def test_locked_contract_enrichment_preserves_existing_behavior(self) -> None:
+        contract = {"functional_decomposition": ["locked behavior"], "implementation_surfaces": [{"name": "surface", "decision": "locked"}]}
+        enriched = copy.deepcopy(contract)
+        enriched["implementation_surfaces"][0]["execution_steps"] = ["inspect", "implement"]
+        self.assertTrue(pm.additive_implementation_contract_update(contract, enriched))
+        changed = copy.deepcopy(enriched)
+        changed["functional_decomposition"] = ["new behavior"]
+        self.assertFalse(pm.additive_implementation_contract_update(contract, changed))
+        changed = copy.deepcopy(enriched)
+        changed["new_product_rule"] = "not authorized"
+        self.assertFalse(pm.additive_implementation_contract_update(contract, changed))
+        changed = copy.deepcopy(enriched)
+        changed["implementation_surfaces"][0]["new_behavior"] = "not authorized"
+        self.assertFalse(pm.additive_implementation_contract_update(contract, changed))
+
+    def test_package_copied_into_new_directory_requires_identity_review(self) -> None:
+        state = self.confirmed_snapshot()
+        package = self.make_package(state)
+        package.write_text("# REQ-001 v0\n旧版本包未经重新调查", encoding="utf-8")
+        report = pm.delivery_diagnostics(self.root, state)
+        self.assertIn("ENGINEERING_PACKAGE_IDENTITY_UNVERIFIED", [f["code"] for f in report["findings"]])
+
+    def test_gate_promotion_waits_for_package_and_work_packages(self) -> None:
+        from unittest.mock import patch
+        state = self.confirmed_snapshot()
+        with patch.object(pm, "shaping_gaps", return_value=[]):
+            report = pm.delivery_diagnostics(self.root, state)
+        action = next(f for f in report["findings"] if f["code"] == "BUILD_GATE_REVIEW_PENDING")
+        self.assertTrue(action["depends_on"])
+        self.assertFalse(action["ready_to_execute"])
+        self.assertNotIn(action["id"], report["ready_action_ids"])
+        self.assertIn("REQ-001:ENGINEERING_PACKAGE_MISSING", report["ready_action_ids"])
 
 
 if __name__ == "__main__":

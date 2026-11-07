@@ -1,0 +1,6 @@
+interface:
+  display_name: "Project Development"
+  short_description: "Build, verify and audit code from approved requirements"
+  default_prompt: "Use $project-development to turn this ready requirement into an engineering package and implementation."
+policy:
+  allow_implicit_invocation: true

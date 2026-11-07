@@ -1,5 +1,6 @@
 __pycache__/
 *.pyc
+.pytest_cache/
 pm-sandbox/ai-assistant/.project-to-act/local/
 write.lock
 write.lock.stale-*

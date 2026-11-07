@@ -27,6 +27,8 @@
 
 `resume` 返回同一份进度摘要：已完成工作包、进行中与下一步、待敲定需求、开放风险、最近状态变更和已导入 session 归档。session 归档只读取经过导入和脱敏的用户/助手公开消息；没有归档时，以状态变更和结构化决定作为当前工作总结，不编造会话原文。
 
+`DEVELOPMENT-GUIDE.md` 同样从最新状态、工程包文件和索引派生，init/apply/index 自动刷新；doctor 默认只读，doctor --write-report 写完整项目引导。它列出每个交接缺口的原因、目标位置、步骤、执行者、完成条件和是否需用户决定；派生 ID 不替代正式 WP。resume/概览必须保留这些 REQ 级动作，不能因存在通用工作包而省略。工程内容复核、实现验证和产品验收不由文件存在自动推断。配置使用其他文档根时，PROJECT_CONFIG.json 的 canonical_docs_root 可显式指定工程区根；该设置不迁移 PM 状态或既有文档。
+
 需求确认问题属于 `state.json` 当前状态的一部分。`decision_questions` 中状态为 `accepted` 或 `overridden` 的问题视为已回答；历史定档文档、会话归档和搜索索引只提供证据，不能重新打开已回答问题。只有新来源、新证据、冲突或用户可观察行为变化才允许追加问题并升级需求版本。
 
 ## 跨会话协作状态
@@ -39,11 +41,16 @@
 
 操作包括：
 
+阶段配置与交付另有 `configure_delivery`、`record_coverage`、`record_delivery_gap`、`review_stage`，格式与证据规范见 [DELIVERY-1](delivery-lifecycle.md)。这些操作沿用同一 revision/写锁/原子事务，不升级需求版本或改确认锁。阶段配置位于 project.delivery_workflow，结果位于 requirements[].delivery；不能用普通 revise 写入 delivery，也不能手改状态。DELIVERY-WORKFLOW.md 是派生视图，不是新状态源。
+
 - `set_project`：修改项目阶段、当前模式、名称、目标和时区等项目字段。
 - `add`：向受支持集合加入带稳定 ID 的记录。
 - `revise`：带 `expected_version` 修改条目并自动升级版本。
 - `transition`：带预期旧状态改变需求、工作包、里程碑或风险状态。
 - `add_source_ref`：给既有条目增加来源，不改变语义版本。
+
+`unlock_confirmation` 只用于有明确来源的范围变更：工具将原确认锁、确认包和门禁材料保存在 `confirmation_history`，新版本回到 `pending_confirmation / ready_for_design`。旧包不被改写为新版本已展示的确认；已回答问题继续保留，重新定档只处理实际变化。
+AI 复核版本使用 `ai_confirmed_unverified`、`human_verification=unverified` 和 `gate.confirmation_protocol=ai_review_unverified`；该协议不能用于标记人工 `confirmed`，也不绕过完整工程设计与就绪检查。
 
 需求、工作包、里程碑、风险受状态机约束，状态只能通过 `transition` 改变。评审和证据不设状态机，状态通过 `revise` 修改并随版本升级留痕。
 

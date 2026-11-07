@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import copy
 import hashlib
+import importlib.util
 from html import escape as html_escape
 import json
 import os
@@ -17,6 +18,11 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+_workflow_spec = importlib.util.spec_from_file_location("project_delivery_workflow", Path(__file__).with_name("delivery_workflow.py"))
+assert _workflow_spec and _workflow_spec.loader
+workflow = importlib.util.module_from_spec(_workflow_spec)
+_workflow_spec.loader.exec_module(workflow)
 
 
 SCHEMA_VERSION = 1
@@ -95,6 +101,7 @@ BUILD_GATE_FIELDS = {
     "feature_shaping_rounds": {"rounds", "completion_policy"},
     "gate": {"status", "review_lenses", "confirmed_source", "confirmation_protocol", "confirmed_scope_statement"},
 }
+BUILD_GATE_ONLY_FIELDS = {"readiness", "feature_shaping_rounds", "gate", "gate_audit"}
 WORK_STATUSES = {"not_started", "in_progress", "blocked", "done", "cancelled"}
 MILESTONE_STATUSES = {"planned", "in_progress", "blocked", "reached", "missed", "cancelled"}
 RISK_STATUSES = {"open", "mitigating", "accepted", "closed", "occurred"}
@@ -288,6 +295,29 @@ def get_record(state: dict[str, Any], collection: str, record_id: str) -> dict[s
     if record is None:
         raise PMError(f"unknown {collection} id: {record_id}")
     return record
+
+
+def additive_implementation_contract_update(existing: Any, incoming: Any) -> bool:
+    """Enrich existing surfaces without changing locked product or contract values."""
+    if not isinstance(existing, dict) or not isinstance(incoming, dict) or set(existing) != set(incoming):
+        return False
+    allowed_additions = {"execution_steps", "interfaces_or_data", "failure_and_rollback", "observability", "test_mapping"}
+    for key, old_value in existing.items():
+        new_value = incoming[key]
+        if key == "implementation_surfaces" and isinstance(old_value, list) and isinstance(new_value, list):
+            if len(old_value) != len(new_value):
+                return False
+            for old, new in zip(old_value, new_value):
+                if not isinstance(old, dict) or not isinstance(new, dict):
+                    return False
+                if any(k not in new or new[k] != value for k, value in old.items()):
+                    return False
+                added = set(new) - set(old)
+                if added - allowed_additions or any(new[k] in (None, "", [], {}) for k in added):
+                    return False
+        elif new_value != old_value:
+            return False
+    return True
 
 
 def validate_record(collection: str, record: dict[str, Any]) -> None:
@@ -509,7 +539,10 @@ def validate_record(collection: str, record: dict[str, Any]) -> None:
                 raise PMError(f"{record_id} requires an approved feature-shaping gate")
             if not gate.get("confirmed_source"):
                 raise PMError(f"{record_id} requires gate.confirmed_source")
-            if gate.get("confirmation_protocol") != "explicit_scope_confirmation":
+            protocols = {"explicit_scope_confirmation"}
+            if record.get("status") == "ai_confirmed_unverified":
+                protocols.add("ai_review_unverified")
+            if gate.get("confirmation_protocol") not in protocols:
                 raise PMError(f"{record_id} requires explicit scope confirmation protocol")
             if not str(gate.get("confirmed_scope_statement", "")).strip():
                 raise PMError(f"{record_id} requires a confirmed scope statement")
@@ -553,12 +586,40 @@ def canonical_record(record: dict[str, Any]) -> str:
     return json.dumps({k: v for k, v in record.items() if k not in ignored}, ensure_ascii=False, sort_keys=True)
 
 
-def apply_operation(state: dict[str, Any], op: dict[str, Any], stamp: str) -> dict[str, Any]:
+def apply_operation(state: dict[str, Any], op: dict[str, Any], stamp: str, root: Path | None = None) -> dict[str, Any]:
+    if op.get("op") in workflow.OPERATIONS:
+        if root is None:
+            raise PMError("delivery operations require project root")
+        try:
+            if op.get("op") == "review_stage" and op.get("result") == "passed":
+                req = get_record(state, "requirements", op.get("requirement_id"))
+                if op.get("stage") in {"specification", "engineering"}:
+                    gaps = shaping_gaps(req)
+                    if gaps:
+                        raise PMError("specification material incomplete: " + "; ".join(gaps))
+            result = workflow.apply(root, state, op, stamp)
+            if op.get("op") == "review_stage" and op.get("result") == "passed":
+                req = get_record(state, "requirements", op["requirement_id"])
+                if op.get("stage") == "engineering" and req.get("gate", {}).get("status") == "confirmed_locked":
+                    req["gate"]["status"] = "approved"
+                validate_record("requirements", req)
+            return result
+        except (workflow.WorkflowError, OSError, KeyError, TypeError, ValueError) as exc:
+            raise PMError(str(exc)) from exc
+    if op.get("op") == "set_project" and {"delivery_workflow", "delivery_workflow_history"} & set(op.get("patch", {}) or op.get("fields", {})):
+        raise PMError("use configure_delivery to change stage configuration")
+    if op.get("collection") == "requirements" and (
+        "delivery" in op.get("patch", {}) or "delivery" in op.get("record", {})
+    ):
+        raise PMError("use delivery operations for receipts and coverage")
     kind = op.get("op")
     if kind == "set_project":
         patch = op.get("patch")
         if not isinstance(patch, dict):
             raise PMError("set_project requires patch object")
+        if workflow.config(state) and (patch.get("stage") == "closed" or patch.get("closure_status") == "closed"):
+            if root is None or workflow.report(root, state)["stage_results"]["acceptance"] != "passed":
+                raise PMError("project closure requires current product acceptance for the configured scope")
         allowed = {
             "name", "stage", "active_mode", "timezone", "goal", "success_outcomes", "in_scope",
             "out_of_scope", "owner", "acceptor", "closure_status"
@@ -588,8 +649,19 @@ def apply_operation(state: dict[str, Any], op: dict[str, Any], stamp: str) -> di
             raise PMError("unlock_confirmation requires source_ref and reason")
         get_record(state, "sources", source_ref)
         old = record.get("status")
-        record.pop("confirmation_lock", None)
+        # A package was presented and approved for the old version. Keep that
+        # evidence without claiming it was presented for the new scope/version.
+        historical = {key: copy.deepcopy(record.pop(key)) for key in (
+            "confirmation_lock", "confirmation_package", "gate", "gate_audit", "feature_shaping_rounds",
+        ) if key in record}
+        record.setdefault("confirmation_history", []).append({
+            "requirement_version": record.get("version", 1), "status": old,
+            "readiness": record.get("readiness", "not_ready"),
+            "artifacts": historical, "scope_change_source_ref": source_ref,
+            "reason": reason, "timestamp": stamp,
+        })
         record["status"] = "pending_confirmation"
+        record["readiness"] = "ready_for_design"
         record["version"] = record.get("version", 1) + 1
         record["updated_at"] = stamp
         record.setdefault("status_history", []).append({
@@ -631,8 +703,32 @@ def apply_operation(state: dict[str, Any], op: dict[str, Any], stamp: str) -> di
         patch = op.get("patch")
         if not isinstance(patch, dict) or not patch:
             raise PMError("revise requires non-empty patch")
-        metadata_only = collection == "requirements" and set(patch).issubset({"code_mapping", "implementation_evidence", "source_map_status"})
-        if collection == "requirements" and record.get("confirmation_lock", {}).get("status") == "locked" and not metadata_only:
+        metadata_only = collection == "requirements" and set(patch).issubset({
+            "code_mapping", "implementation_evidence", "source_map_status",
+            "ownership_contract", "development_manual_ref", "ownership_matrix_ref",
+        })
+        if (collection == "requirements" and set(patch) == {"implementation_contract"}
+                and additive_implementation_contract_update(record.get("implementation_contract"), patch["implementation_contract"])):
+            if op.get("change_class") != "wording_only":
+                raise PMError("additive implementation metadata requires change_class=wording_only")
+            metadata_only = True
+        gate_only = collection == "requirements" and bool(patch) and set(patch).issubset(BUILD_GATE_ONLY_FIELDS)
+        locked_gate_only = gate_only and record.get("confirmation_lock", {}).get("status") == "locked"
+        if locked_gate_only:
+            if "readiness" in patch and patch["readiness"] != "ready_for_build":
+                raise PMError("locked build-gate updates may only set readiness=ready_for_build")
+            existing_gate = record.get("gate")
+            incoming_gate = patch.get("gate")
+            if existing_gate is not None and "gate" in patch:
+                if not isinstance(incoming_gate, dict):
+                    raise PMError(f"{record_id}.gate cannot be removed after confirmation is locked")
+                old_status, new_status = existing_gate.get("status"), incoming_gate.get("status")
+                if new_status != old_status and not (old_status == "confirmed_locked" and new_status == "approved"):
+                    raise PMError(f"{record_id}.gate.status is protected; only confirmed_locked to approved is allowed during build-gate completion")
+                for field in ("confirmed_source", "confirmation_protocol", "confirmed_scope_statement"):
+                    if incoming_gate.get(field) != existing_gate.get(field):
+                        raise PMError(f"{record_id}.gate.{field} is protected by confirmation_lock")
+        if collection == "requirements" and record.get("confirmation_lock", {}).get("status") == "locked" and not metadata_only and not gate_only:
             if set(op.get("patch", {})) & CONFIRMATION_PROTECTED_FIELDS:
                 raise PMError(
                     f"{record_id} confirmation is locked; an explicit scope change request is required before changing: "
@@ -650,7 +746,7 @@ def apply_operation(state: dict[str, Any], op: dict[str, Any], stamp: str) -> di
         if "status" in patch and collection in ALLOWED_TRANSITIONS:
             raise PMError("use transition to change status")
         record.update(copy.deepcopy(patch))
-        if not metadata_only:
+        if not metadata_only and not gate_only:
             record["version"] = record.get("version", 1) + 1
         record["updated_at"] = stamp
         validate_record(collection, record)
@@ -668,6 +764,28 @@ def apply_operation(state: dict[str, Any], op: dict[str, Any], stamp: str) -> di
         return {"op": kind, "collection": collection, "id": record_id, "version": record["version"]}
 
     if kind == "transition":
+        if collection == "work_packages" and op.get("to") == "done" and workflow.config(state) and record.get("kind") in {"implementation", "verification", "foundation"}:
+            if root is None:
+                raise PMError("engineering WP completion requires project root")
+            try:
+                configured = {r["id"] for r in workflow.config(state)["scope"]}
+                for rid in record.get("requirement_ids", []):
+                    if rid not in configured:
+                        continue
+                    req = get_record(state, "requirements", rid)
+                    manifest, _ = workflow.engineering_manifest(root, state, req)
+                    mapped = {r["ac_id"] for r in manifest["traceability"] if record_id in r["work_package_ids"]}
+                    if not mapped:
+                        raise PMError(f"{record_id} has no AC traceability for {rid}")
+                    coverage = {r["ac_id"]: r for r in workflow.coverage_rows(root, state, req)}
+                    for acid in mapped:
+                        row = coverage[acid]
+                        if row["implementation"] != "complete" or row["verification"] != "passed":
+                            raise PMError(f"{record_id}/{acid} completion needs complete implementation and current passing verification")
+                        if workflow.scope_entry(state, req)["ui_required"] and row["frontend"] != "complete" and not (row["frontend"] == "not_required" and row.get("frontend_reason")):
+                            raise PMError(f"{record_id}/{acid} completion needs frontend implementation or an applicability reason")
+            except workflow.WorkflowError as exc:
+                raise PMError(str(exc)) from exc
         if collection == "requirements" and record.get("confirmation_lock", {}).get("status") == "locked":
             raise PMError(f"{record_id} confirmation is locked; an explicit scope change request is required before transition")
         old = record.get("status")
@@ -830,6 +948,12 @@ def render_action_card(action: dict[str, Any]) -> str:
         acceptance_html = f'<details class="action-acceptance"><summary>验收标准（{len(criteria)} 条）</summary>{html_bullets(criteria)}</details>'
     else:
         acceptance_html = '<p class="missing">验收标准：待补充</p>'
+    guidance_html = ""
+    if action.get("source") == "delivery_diagnostic":
+        guidance_html = (f'<p><strong>原因：</strong>{html_text(action.get("reason"))}</p>'
+                         f'<p><strong>需要用户决定：</strong>{"是" if action.get("needs_user_decision") else "否，AI 继续处理"}</p>'
+                         f'<details><summary>执行步骤与补齐位置</summary>{html_bullets(action.get("steps"))}'
+                         f'<p>{html_text(action.get("target"))}</p></details>')
     return "".join([
         f'<article class="action-card {html_status_class(action.get("status"))}">',
         f'<div class="action-heading"><span class="badge">{html_text(action.get("id"))}</span>',
@@ -838,6 +962,7 @@ def render_action_card(action: dict[str, Any]) -> str:
         f'<div class="action-meta"><span><strong>负责人</strong>{html_text(action.get("owner") or "待指定")}</span>',
         f'<span><strong>截止时间</strong>{html_text(action.get("due_at") or "待设置")}</span>',
         f'<span><strong>关联功能</strong>{html_text(action.get("requirement_ids"))}</span></div>',
+        guidance_html,
         acceptance_html,
         missing_html,
         '</article>',
@@ -901,6 +1026,8 @@ def requirement_overview(req: dict[str, Any]) -> tuple[str, list[str]]:
         if questions:
             return "AI已确认/待人工核验·待回答", questions
         return "AI已确认/待人工核验", questions
+    if req.get("status") == "superseded":
+        return "已替代", questions
     if req.get("status") != "confirmed":
         return "需求未确认", questions
     if questions:
@@ -1316,6 +1443,259 @@ def build_daily_progress(state: dict[str, Any], session_archives: list[dict[str,
     return daily
 
 
+def engineering_docs_root(root: Path) -> Path:
+    """Honor an explicitly configured docs root; never guess or relocate it."""
+    config_path = root / ".project-to-act" / "PROJECT_CONFIG.json"
+    config = read_json(config_path) if config_path.exists() else {}
+    configured = config.get("canonical_docs_root") or str(DOCS_REL.parent)
+    return (root / configured).resolve()
+
+
+def shaping_gaps(req: dict[str, Any]) -> list[str]:
+    """Collect missing material before the first-error schema validator runs."""
+    gaps = []
+    for section, fields in BUILD_GATE_FIELDS.items():
+        value = req.get(section)
+        if not isinstance(value, dict):
+            gaps.append(section)
+            continue
+        for field in sorted(fields):
+            if section == "gate" and field != "review_lenses":
+                continue  # Approval fields are supplied by confirmation, not design work.
+            if field not in value or (value[field] in (None, "", [], {}) and field not in {
+                "unresolved_items", "decisions",
+            }):
+                gaps.append(f"{section}.{field}")
+    if not req.get("acceptance_scenarios"):
+        gaps.append("acceptance_scenarios")
+    # Check deeper invariants without changing the actual requirement or its lock.
+    if not gaps:
+        probe = copy.deepcopy(req)
+        probe.update(status="confirmed", readiness="ready_for_build")
+        probe["gate"].update(status="approved", confirmed_source="SRC-VALIDATION-ONLY",
+                             confirmation_protocol="explicit_scope_confirmation",
+                             confirmed_scope_statement="validation-only; never persisted")
+        try:
+            validate_record("requirements", probe)
+        except PMError as exc:
+            gaps.append(str(exc))
+    return gaps
+
+
+def delivery_diagnostics(root: Path, state: dict[str, Any], requirement_ids: list[str] | None = None) -> dict[str, Any]:
+    """Read-only handoff checks. A file or schema pass is never product acceptance."""
+    selected = set(requirement_ids or [])
+    known = {req["id"] for req in state["requirements"]}
+    if selected - known:
+        raise PMError(f"unknown requirement IDs: {', '.join(sorted(selected - known))}")
+    docs_root = engineering_docs_root(root)
+    development_root = docs_root / "project-development"
+    findings: list[dict[str, Any]] = []
+    rows = []
+
+    def finding(req: dict[str, Any], code: str, stage: str, reason: str, action: str,
+                steps: list[str], done: str, *, needs_user: bool = False,
+                target: str = "", priority: str = "P1", fields: list[str] | None = None) -> None:
+        findings.append({
+            "id": f"{req['id']}:{code}", "code": code, "record": req["id"],
+            "requirement_version": req.get("version", 1), "stage": stage,
+            "priority": priority, "reason": reason, "action": action, "steps": steps,
+            "owner": "用户（产品决定）" if needs_user else "AI（项目经理/开发）",
+            "needs_user_decision": needs_user, "target": target,
+            "acceptance_criteria": [done], "missing_fields": fields or [],
+            "due_at": req.get("due_at") or req.get("target_date"),
+            "source": "delivery_diagnostic", "requirement_ids": [req["id"]],
+            "status": "waiting_user" if needs_user else "not_started",
+        })
+
+    for req in state["requirements"]:
+        rid = req["id"]
+        if (selected and rid not in selected) or req.get("status") in {"rejected", "superseded", "candidate"}:
+            continue
+        if not re.fullmatch(r"REQ-[A-Za-z0-9][A-Za-z0-9_-]*", rid) or not isinstance(req.get("version", 1), int) or req.get("version", 1) < 1:
+            raise PMError(f"unsafe requirement ID or version for engineering package path: {rid}")
+        start = len(findings)
+        confirmed = req.get("status") in {"confirmed", "ai_confirmed_unverified"}
+        extension = req.get("readiness") == "confirmed_for_extension"
+        questions = [q for q in req.get("decision_questions") or [] if q.get("status") in {"open", "deferred"}]
+        gaps = [] if extension else shaping_gaps(req)
+        package_dir = development_root / "packages" / rid / f"v{req.get('version', 1)}"
+        package = package_dir / "ENGINEERING-PACKAGE.md"
+        older = sorted(package_dir.parent.glob("v*/ENGINEERING-PACKAGE.md")) if package_dir.parent.exists() else []
+        linked = [wp for wp in state["work_packages"] if rid in (wp.get("requirement_ids") or []) and wp.get("status") != "cancelled"]
+        engineering_work = [wp for wp in linked if wp.get("kind") not in {"discovery", "governance", "confirmation"}
+                            and (len(wp.get("requirement_ids") or []) == 1
+                                 or wp.get("kind") in {"implementation", "verification", "foundation"})]
+        if gaps:
+            finding(req, "FEATURE_SHAPING_INCOMPLETE", "engineering" if confirmed else "product",
+                    "缺少可交给实现者的结构化设计或审查记录；这属于待补齐材料，不能仅称为用户未确认。",
+                    f"补齐 {rid} 的定档材料：{'、'.join(gaps)}",
+                    ["读取当前版本已回答问题、确认来源、详细草案和真实代码，复用已有结论。",
+                     "按 missing_fields 补结构化记录、原子功能、状态和验证计划；不要求先实现或先验收。",
+                     "仅将真正新增的产品行为取舍发给用户；没有新取舍时自主补齐并重新预检。"],
+                    "缺失材料有可追溯内容且五类设计检查通过，产品范围与既有决定一致。",
+                    target=str(root / DOCS_REL / STATE_NAME), fields=gaps,
+                    priority="P0" if req.get("readiness") in BUILD_READINESS else "P1")
+        if req.get("readiness") in BUILD_READINESS:
+            try:
+                validate_record("requirements", req)
+            except PMError as exc:
+                finding(req, "BUILD_GATE_RECORD_INVALID", "engineering", str(exc),
+                        f"修复 {rid} 当前已声明门禁与真实记录的不一致",
+                        ["核对缺失字段和有效确认来源，按锁保护规则修复；不得伪造来源或放宽门禁。"],
+                        "当前记录本身通过真实门禁校验，未使用诊断预检值代替确认。", priority="P0")
+        if questions or req.get("open_questions"):
+            finding(req, "PRODUCT_DECISIONS_OPEN", "product", "存在尚未回答或明确延期的产品决定。",
+                    f"展示 {rid} 当前未决确认项及推荐方案",
+                    ["沿用当前问题 ID、版本和用户已回答内容，不重新询问已关闭问题。",
+                     "给出各未决项的推荐、替代、行为影响及回答入口；deferred 项只在新证据或行为变化时重开。"],
+                    "当前范围的未决项已明确选择，或有可追溯的延期/非目标处理。", needs_user=True)
+        closure_received = bool(req.get("closure_attempt", {}).get("source_ref") or
+                                req.get("confirmation_package_status", {}).get("closure_signal_received"))
+        if not confirmed and not questions and not req.get("open_questions") and not gaps:
+            finding(req, "CONFIRMATION_RECORD_PENDING" if closure_received else "SCOPE_CONFIRMATION_PENDING", "product",
+                    "已收到封闭指令，需校验并落盘。" if closure_received else "设计材料齐备，但尚无当前范围的明确需求级确认。",
+                    f"核对 {rid} 已有封闭来源并完成状态预检" if closure_received else f"展示 {rid} 最终范围和封闭入口",
+                    ["检查来源确实覆盖当前版本；若范围未变，复用已有封闭指令，不要求用户重复确认。" if closure_received
+                     else "说明本轮完整范围、非目标、关键行为及确认后的自动工程交接动作，等待明确需求级确认。"],
+                    "状态和确认来源准确，AI 确认保留未人工核验标记。", needs_user=not closure_received)
+        if not package.is_file():
+            code = "ENGINEERING_PACKAGE_STALE" if older else "ENGINEERING_PACKAGE_MISSING"
+            finding(req, code, "engineering", "当前版本没有工程包。" + ("已有其他版本工程包，须评估差异后建立新版。" if older else ""),
+                    f"为 {rid} v{req.get('version', 1)} 调用 project-development 工程包模式",
+                    ["先核对本期范围与模块归属；占位或由其他 REQ 承载时沿用既有决定，不自建实现范围。",
+                     "调查真实仓库基线、入口、模块和现有改动；保留旧版并引用替代关系。",
+                     "写工程设计、接口/数据契约、执行工作包、验证计划与回滚；输入不足时标 draft/blocked。",
+                     "同步版本索引、开发区索引和根索引，通过 PM 操作回写 WP/EVD 引用后重跑 doctor。"],
+                    "当前版本工程包、基线、可执行步骤、追踪关系和索引齐备；草稿不算开发就绪。",
+                    target=str(package), priority="P0" if req.get("readiness") in BUILD_READINESS else "P1")
+        else:
+            text = package.read_text(encoding="utf-8-sig")
+            if not text.strip() or "<!-- pm:package-draft -->" in text:
+                finding(req, "ENGINEERING_PACKAGE_DRAFT", "engineering", "工程包为空或显式标为未完成草稿。",
+                        f"完成 {rid} 工程调查与执行契约", ["按工程包缺口完成调查，移除草稿标记前复核真实内容。"],
+                        "工程包内容完成且可执行；不得用文件存在替代内容审查。", target=str(package))
+            elif rid not in text or not re.search(rf"\bv{req.get('version', 1)}\b", text[:400], flags=re.IGNORECASE):
+                finding(req, "ENGINEERING_PACKAGE_IDENTITY_UNVERIFIED", "engineering",
+                        "工程包正文未能识别出当前 REQ 与版本，不能只根据目录认为它匹配。",
+                        f"核对 {rid} 工程包身份与输入版本",
+                        ["核对包头、输入规格、变更差异及确认来源；补正确身份，不能仅改标题冒充已复核。"],
+                        "包头清楚标注当前 REQ/版本，内容已按当前契约复核。", target=str(package))
+            missing_indexes = []
+            for index_path in (package_dir / "INDEX.md", development_root / "INDEX.md", docs_root / "README.md"):
+                relative = package.relative_to(index_path.parent).as_posix() if package.is_relative_to(index_path.parent) else ""
+                # Root index links to the development index, not every individual package.
+                expected = "project-development/INDEX.md" if index_path == docs_root / "README.md" else relative
+                if not index_path.is_file() or (expected and expected not in index_path.read_text(encoding="utf-8-sig")):
+                    missing_indexes.append(str(index_path))
+            if missing_indexes:
+                finding(req, "ENGINEERING_INDEX_INCOMPLETE", "engineering", "工程文档存在，但索引缺失或未登记当前版本路径。",
+                        f"补齐 {rid} 工程包入口索引", ["在既有索引原位登记当前路径、版本、用途和旧版替代关系。"],
+                        "版本索引、开发区索引和根索引均能发现当前版本工程包。", fields=missing_indexes)
+        if confirmed and not engineering_work:
+            finding(req, "CONFIRMED_WITHOUT_WORK_PACKAGE", "engineering", "没有非取消的专属或明确声明用途的工程工作包；通用治理任务不能替代实现任务。",
+                    f"登记 {rid} 的实现/验证工作包", ["按纵向交付划分 WP，写关联 REQ、kind、步骤、依赖、完成条件和验证方法。",
+                     "用最新 revision 和有效来源经 apply --dry-run、apply 登记；不直接编辑 state.json。"],
+                    "可执行工作包已登记且需求/工程包/WP 的引用一致。")
+        if confirmed and not extension and not gaps and req.get("readiness") not in BUILD_READINESS:
+            finding(req, "BUILD_GATE_REVIEW_PENDING", "engineering", "产品已确认且结构化设计可预检，开发就绪状态尚未同步。",
+                    f"完成 {rid} 独立开发门禁复核并同步 readiness",
+                    ["先完成工程包、WP、代码调查和接口审查，对拟提交的 gate-only 更新运行 apply --dry-run。",
+                     "沿用有效确认来源，以允许的 gate-only 操作 dry-run 后推进；不解锁或改产品范围，不要求先实现。"],
+                    "工程交接复核通过且合法推进 ready_for_build；实现与验收仍分别记录。")
+        for wp in engineering_work:
+            if wp.get("status") in {"not_started", "in_progress", "blocked"} and not wp.get("next_action"):
+                finding(req, "WORK_PACKAGE_ACTION_MISSING", "planning", f"{wp['id']} 只有状态，没有可执行的下一步。",
+                        f"为 {wp['id']} 补实施动作和完成条件",
+                        ["读取该 WP 的工程包步骤，填写 next_action、负责人、依赖、完成条件及验证方法；日期未知时保留待协商。"],
+                        "工作包能说明接下来修改/调查什么、交付什么、如何验证。", target=wp["id"], priority="P2")
+        current = findings[start:]
+        blockers = [f for f in current if f["stage"] in {"product", "engineering"}]
+        rows.append({
+            "id": rid, "version": req.get("version", 1), "status": req.get("status"),
+            "readiness": req.get("readiness"), "package_path": str(package), "package_exists": package.is_file(),
+            "other_package_paths": [str(p) for p in older if p != package],
+            "engineering_work_package_ids": [wp["id"] for wp in engineering_work],
+            "can_start_full_build": confirmed and not extension and req.get("readiness") == "ready_for_build" and not blockers,
+            "extension_only": extension, "closure_signal_received": closure_received,
+            "blocking_codes": [f["code"] for f in blockers],
+            "verification": "not_assessed", "acceptance": "not_assessed",
+        })
+    if workflow.config(state):
+        lifecycle = workflow.report(root, state, requirement_ids)
+        lifecycle_rows = {r["id"]: r for r in lifecycle["requirements"]}
+        for row in rows:
+            current = lifecycle_rows.get(row["id"])
+            if current:
+                row["stage_results"] = {k: v["result"] for k, v in current["stages"].items()}
+                row["can_start_full_build"] = row["can_start_full_build"] and current["stages"]["engineering"]["result"] == "passed"
+                row["verification"] = current["stages"]["verification"]["result"]
+                row["acceptance"] = current["stages"]["acceptance"]["result"]
+                if current["stages"]["engineering"]["result"] != "passed":
+                    row["blocking_codes"].append("STAGE_HANDOFF_NOT_PASSED")
+                if current["next_stage"]:
+                    stage = current["next_stage"]
+                    req = get_record(state, "requirements", row["id"])
+                    finding(req, "DELIVERY_STAGE_" + stage.upper(), stage,
+                            "; ".join(current["stages"][stage]["gaps"][:6]) or "阶段内容验收尚未通过。",
+                            f"完成 {stage} 内容复核并记录交接回执",
+                            ["读取 workflow 的逐 AC 覆盖、已有设计/代码/证据，复核复用；未评估不表示未实现。",
+                             "自主补齐工程材料、实现或验证缺口，按 DELIVERY-1 记录 review_stage；新增产品决定才询问用户。"],
+                            "本阶段内容与当前证据已复核，合法写入回执，继续已授权下一阶段。",
+                            needs_user=stage == "acceptance", target=str(root / DOCS_REL / "DELIVERY-WORKFLOW.md"))
+    for item in findings:
+        item["depends_on"] = ([f["id"] for f in findings if f["record"] == item["record"]
+                               and f["id"] != item["id"] and f["stage"] in {"product", "engineering"}]
+                              if item["code"] == "BUILD_GATE_REVIEW_PENDING" else [])
+        item["ready_to_execute"] = not item["needs_user_decision"] and not item["depends_on"]
+    findings.sort(key=lambda f: (f["priority"], bool(f["depends_on"]), f["record"], f["code"]))
+    return {"revision": state["revision"], "generated_at": now_iso(), "requirements": rows, "findings": findings,
+            "automatic_action_ids": [f["id"] for f in findings if not f["needs_user_decision"]],
+            "ready_action_ids": [f["id"] for f in findings if f["ready_to_execute"]],
+            "user_decision_ids": [f["id"] for f in findings if f["needs_user_decision"]],
+            "notice": "脚本检查结构、文件和引用；工程内容、源码及产品验收仍需对应证据审查。未实现/未执行验收不阻止准备工程包。"}
+
+
+def render_development_guide(report: dict[str, Any]) -> str:
+    lines = ["# 开发衔接与缺口处理", "", "> 由 pm.py 自动生成；不修改需求状态，不代表产品验收。", "",
+             f"PM revision：{report['revision']}；生成于 {report['generated_at']}", "", report["notice"], "",
+             "## 当前需求", "", "| REQ | 版本 | 状态 / 就绪度 | 当前工程包 | 可开始完整开发 |", "|---|---|---|---|---|"]
+    for row in report["requirements"]:
+        outcome = (('工程阶段已签收，可按既有授权执行' if row.get('stage_results') else '结构条件已满足，执行前复核契约') if row['can_start_full_build'] else
+                   ' / '.join(row['blocking_codes']) or ('仅已授权基础扩展' if row['extension_only'] else '按当前阶段处理'))
+        lines.append(f"| {row['id']} | v{row['version']} | {row['status']} / {row['readiness']} | {'存在' if row['package_exists'] else '缺失'} | {outcome} |")
+    lines += ["", "## 自动补齐队列与待决定事项", ""]
+    for item in report["findings"]:
+        lines += [f"### {item['priority']} · {item['record']} · {item['code']}", "",
+                  f"- 原因：{item['reason']}", f"- 下一步：{item['action']}", f"- 执行者：{item['owner']}",
+                  f"- 是否需要用户决定：{'是' if item['needs_user_decision'] else '否，AI 继续处理'}",
+                  f"- 位置：{item['target'] or '当前 REQ 的结构化记录/确认包'}",
+                  f"- 截止：{item['due_at'] or '待协商，不虚构日期'}", "",
+                  f"- 前置动作：{'、'.join(item['depends_on']) or '无脚本已识别的前置阻塞；执行时核对现有契约'}", "",
+                  *[f"{i}. {step}" for i, step in enumerate(item['steps'], 1)], "",
+                  f"完成条件：{item['acceptance_criteria'][0]}", ""]
+    if not report["findings"]:
+        lines += ["当前检查未发现交接结构缺口；继续按工程包执行和验证。", ""]
+    return "\n".join(lines)
+
+
+def cmd_doctor(args: argparse.Namespace) -> dict[str, Any]:
+    state = load_state(args.project_root)
+    report = delivery_diagnostics(args.project_root, state, getattr(args, "requirement", None))
+    report["delivery_workflow"] = workflow.report(args.project_root, state, getattr(args, "requirement", None))
+    if getattr(args, "write_report", False):
+        # Always persist the full project report so a filtered run cannot hide other gaps.
+        with project_lock(args.project_root):
+            state = load_state(args.project_root)
+            full = delivery_diagnostics(args.project_root, state)
+            path = args.project_root / DOCS_REL / "DEVELOPMENT-GUIDE.md"
+            atomic_text(path, render_development_guide(full))
+            report = delivery_diagnostics(args.project_root, state, getattr(args, "requirement", None))
+            report["delivery_workflow"] = workflow.report(args.project_root, state, getattr(args, "requirement", None))
+            report["report_path"] = str(path)
+    return report
+
+
 def build_progress_summary(root: Path, state: dict[str, Any]) -> dict[str, Any]:
     requirements = state["requirements"]
     work_packages = state["work_packages"]
@@ -1349,7 +1729,7 @@ def build_progress_summary(root: Path, state: dict[str, Any]) -> dict[str, Any]:
             missing.append("验收标准")
         next_actions.append({
             "id": item.get("id"),
-            "action": item.get("next_action") or f"推进工作包：{item.get('title')}",
+            "action": item.get("next_action") or f"从关联工程包补齐 {item.get('id')} 的实施步骤、依赖和完成条件，并登记下一项执行动作",
             "status": item.get("status"),
             "owner": owner,
             "due_at": due_at,
@@ -1378,7 +1758,7 @@ def build_progress_summary(root: Path, state: dict[str, Any]) -> dict[str, Any]:
             missing.append("验收标准")
         next_actions.append({
             "id": f"{req.get('id')}-DESIGN",
-            "action": f"完成 {req.get('id')} · {req.get('title')} 的功能定档与开发门禁",
+            "action": req.get("next_action") or f"运行 doctor --requirement {req.get('id')}，逐项处理定档材料、当前工程包与工作包缺口",
             "status": "blocked" if req.get("status") != "confirmed" else "not_started",
             "owner": owner,
             "due_at": due_at,
@@ -1387,6 +1767,9 @@ def build_progress_summary(root: Path, state: dict[str, Any]) -> dict[str, Any]:
             "source": "requirement_gate",
             "missing": missing,
         })
+    diagnostic = delivery_diagnostics(root, state)
+    # Keep WP-specific execution information, but never let a broad WP hide REQ gaps.
+    next_actions = diagnostic["findings"] + next_actions
     session_archives = read_session_archives(root, project.get("timezone") or "UTC")
     return {
         "revision": state.get("revision"),
@@ -1402,6 +1785,7 @@ def build_progress_summary(root: Path, state: dict[str, Any]) -> dict[str, Any]:
         ],
         "pending_requirements": pending_requirements,
         "next_actions": next_actions,
+        "delivery_diagnostics": {key: value for key, value in diagnostic.items() if key != "findings"},
         "open_risks": [
             {"id": risk["id"], "title": risk.get("title"), "status": risk.get("status"), "impact": risk.get("impact"), "response": risk.get("response")}
             for risk in state["risks"] if risk.get("status") != "closed"
@@ -1431,6 +1815,20 @@ def render_project_overview(root: Path, state: dict[str, Any]) -> None:
             undecided.append((req, label, questions))
     done_work = sum(item.get("status") == "done" for item in work_packages)
     generated = now_iso()
+    lifecycle_html = ""
+    if workflow.config(state):
+        flow = workflow.report(root, state)
+        phase_rows = "".join(
+            f'<tr><td>{html_text(row["id"])} v{row["version"]}</td>'
+            + "".join(f'<td>{html_text(row["stages"][s]["result"])}</td>' for s in workflow.STAGES)
+            + f'<td>{html_text(row["next_stage"] or "已交付")}</td></tr>' for row in flow["requirements"]
+        )
+        lifecycle_html = ('<section class="panel"><h2>阶段验收与完整交付</h2>'
+                          '<p>未评估表示尚未核对现有材料，不表示功能未实现。结构检查与阶段验收分别报告。</p>'
+                          f'<p>{html_text(flow["totals"])}</p>'
+                          '<div class="table-wrap"><table><thead><tr><th>REQ</th><th>规格固化</th><th>工程交接</th>'
+                          '<th>完整实现</th><th>技术验证</th><th>产品验收</th><th>下一阶段</th></tr></thead>'
+                          f'<tbody>{phase_rows}</tbody></table></div><p><a href="DELIVERY-WORKFLOW.md">逐条 AC、缺口和责任入口</a></p></section>')
     progress = build_progress_summary(root, state)
 
     feature_rows: list[str] = []
@@ -1554,6 +1952,7 @@ footer {{ margin-top:28px; color:var(--muted); font-size:12px; }} @media(max-wid
 <section class="panel"><h2>功能列表与敲定状态</h2><div class="toolbar"><input id="featureFilter" placeholder="搜索功能、状态、行为或需求 ID" aria-label="搜索功能"></div><div class="table-wrap"><table><thead><tr><th>ID</th><th>功能</th><th>需求状态</th><th>就绪度</th><th>当前判断</th><th>优先级</th></tr></thead><tbody id="featureRows">{"".join(feature_rows) or '<tr><td colspan="6" class="muted">尚无正式需求</td></tr>'}</tbody></table></div></section>
 <section class="feature-list">{"".join(feature_cards) or '<div class="panel muted">尚无功能详情</div>'}</section>
 <section class="panel"><h2>开发工作与项目运行情况</h2><div class="table-wrap"><table><thead><tr><th>ID</th><th>工作包</th><th>状态</th><th>关联功能</th><th>日期</th></tr></thead><tbody>{work_rows}</tbody></table></div><div class="two-col"><div><h3>里程碑</h3><ul>{milestone_rows}</ul></div><div><h3>风险与评审</h3><ul>{risk_rows}{review_rows}</ul></div></div></section>
+{lifecycle_html}
 <footer>本页不是实时服务；它是由 project-manager 根据当前项目状态生成的静态概览。运行 `pm.py apply`、`init` 或 `index` 后会自动刷新。</footer>
 </main><script>const input=document.getElementById('featureFilter'); input?.addEventListener('input',()=>{{const q=input.value.trim().toLowerCase(); document.querySelectorAll('#featureRows tr[data-search],.feature-card[data-search]').forEach(el=>{{el.hidden=q && !el.dataset.search.toLowerCase().includes(q);}});}});</script></body></html>'''
     atomic_text(docs / PROJECT_OVERVIEW_NAME, page)
@@ -1573,6 +1972,8 @@ def render_views(root: Path, state: dict[str, Any]) -> None:
         f"- 状态 revision：`{state['revision']}`", "",
         "## 文档", "",
         "- [需求基线](REQUIREMENTS.md)",
+        "- [开发衔接与缺口处理](DEVELOPMENT-GUIDE.md)",
+        "- [阶段验收、逐项覆盖与交接回执](DELIVERY-WORKFLOW.md)",
         "- [待拓展模块索引](EXTENSION-MODULES.md)",
         "- [模块交互手册](MODULE-INTERACTIONS.md)",
         f"- [项目进度概览]({PROJECT_OVERVIEW_NAME})",
@@ -1726,6 +2127,9 @@ def render_views(root: Path, state: dict[str, Any]) -> None:
     atomic_text(docs / "REQUIREMENTS.md", "\n".join(req_lines) + "\n")
     atomic_text(docs / "DELIVERY.md", "\n".join(delivery) + "\n")
     atomic_text(docs / "DECISIONS.md", "\n".join(decisions) + "\n")
+    atomic_text(docs / "DEVELOPMENT-GUIDE.md", render_development_guide(delivery_diagnostics(root, state)))
+    if workflow.config(state):
+        atomic_text(docs / "DELIVERY-WORKFLOW.md", workflow.markdown(workflow.report(root, state)))
     render_project_overview(root, state)
 
 
@@ -1838,7 +2242,7 @@ def cmd_apply(args: argparse.Namespace) -> dict[str, Any]:
             raise PMError("changes requires non-empty operations list")
         updated = copy.deepcopy(state)
         stamp = now_iso()
-        results = [apply_operation(updated, op, stamp) for op in operations]
+        results = [apply_operation(updated, op, stamp, args.project_root) for op in operations]
         errors = validate_references(updated)
         if errors:
             raise PMError(f"reference validation failed: {json.dumps(errors, ensure_ascii=False)}")
@@ -1863,10 +2267,11 @@ def cmd_apply(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def cmd_index(args: argparse.Namespace) -> dict[str, Any]:
-    state = load_state(args.project_root)
-    render_views(args.project_root, state)
-    index = build_search_index(args.project_root, state)
-    return {"status": "rebuilt", "revision": state["revision"], "entries": len(index["entries"])}
+    with project_lock(args.project_root):
+        state = load_state(args.project_root)
+        render_views(args.project_root, state)
+        index = build_search_index(args.project_root, state)
+        return {"status": "rebuilt", "revision": state["revision"], "entries": len(index["entries"])}
 
 
 def cmd_search(args: argparse.Namespace) -> dict[str, Any]:
@@ -1910,11 +2315,18 @@ def cmd_check(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
             errors.append({"code": "INVALID_DEADLINE", **row})
         elif row["alert"] in {"overdue", "due_soon"}:
             warnings.append({"code": row["alert"].upper(), **row})
-    confirmed = [r for r in state["requirements"] if r.get("status") in {"confirmed", "ai_confirmed_unverified"}]
-    linked = {rid for wp in state["work_packages"] for rid in wp.get("requirement_ids", [])}
-    for req in confirmed:
-        if req["id"] not in linked:
-            warnings.append({"code": "CONFIRMED_WITHOUT_WORK_PACKAGE", "record": req["id"]})
+    diagnostic = delivery_diagnostics(args.project_root, state, getattr(args, "requirement", None))
+    stage = getattr(args, "stage", "all")
+    lifecycle = workflow.report(args.project_root, state, getattr(args, "requirement", None))
+    use_lifecycle = bool(workflow.config(state)) or stage in {"specification", "implementation", "verification", "acceptance"}
+    delivery_warnings = [item for item in diagnostic["findings"] if stage in {"all", item["stage"]}
+                         or (stage == "engineering" and item["stage"] == "product")]
+    warnings.extend({key: item[key] for key in ("id", "code", "record", "stage", "reason", "action")}
+                    for item in delivery_warnings)
+    phase_findings = [f for f in lifecycle["findings"] if stage in {"all", f["stage"]}] if use_lifecycle else []
+    warnings.extend({"code": "STAGE_NOT_PASSED", **f} for f in phase_findings)
+    if use_lifecycle and not lifecycle["configured"]:
+        warnings.append({"code": "DELIVERY_WORKFLOW_NOT_CONFIGURED", "action": "使用 configure_delivery 登记阶段及本期范围；保留旧证据，不自动判定通过。"})
     for item in state["intake_items"]:
         if item.get("disposition", "unclassified") == "unclassified":
             warnings.append({"code": "UNCLASSIFIED_INTAKE_ITEM", "record": item["id"]})
@@ -1924,8 +2336,38 @@ def cmd_check(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
         "revision": state["revision"],
         "errors": errors,
         "warnings": warnings,
+        "stage": stage,
+        "structure_valid": not errors,
+        "stage_results": {
+            "structure": "passed" if not errors else "failed",
+            **{name: "gaps_found" if any(f["stage"] == name for f in diagnostic["findings"]) else "no_structural_gaps_detected"
+               for name in ("product", "engineering", "planning")},
+            "verification": "not_assessed", "acceptance": "not_assessed",
+        },
+        "delivery_diagnostics": diagnostic,
+        "delivery_workflow": lifecycle,
     }
-    return result, 0 if (not errors and (not args.strict or not warnings)) else 1
+    if use_lifecycle:
+        result["stage_results"].update(lifecycle["stage_results"])
+    phase_ok = not (use_lifecycle and stage in workflow.STAGES and (
+        not lifecycle["configured"] or lifecycle["stage_results"][stage] != "passed"))
+    return result, 0 if (not errors and phase_ok and (not args.strict or not warnings)) else 1
+
+
+def cmd_workflow(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
+    state = load_state(args.project_root)
+    report = workflow.report(args.project_root, state, getattr(args, "requirement", None))
+    if getattr(args, "write_report", False):
+        with project_lock(args.project_root):
+            state = load_state(args.project_root)
+            full = workflow.report(args.project_root, state)
+            path = args.project_root / DOCS_REL / "DELIVERY-WORKFLOW.md"
+            atomic_text(path, workflow.markdown(full))
+            report = workflow.report(args.project_root, state, getattr(args, "requirement", None))
+            report["report_path"] = str(path)
+    stages = workflow.STAGES if args.stage == "all" else (args.stage,)
+    passed = report["configured"] and all(report["stage_results"][s] == "passed" for s in stages)
+    return report, 1 if args.strict and not passed else 0
 
 
 def cmd_resume(args: argparse.Namespace) -> dict[str, Any]:
@@ -1964,6 +2406,7 @@ def cmd_resume(args: argparse.Namespace) -> dict[str, Any]:
         "deadline_alerts": [r for r in deadline_rows(state, args.hours) if r["alert"] != "scheduled"],
         "last_changes": state.get("change_events", [])[-5:],
         "progress_summary": build_progress_summary(args.project_root, state),
+        "delivery_workflow": workflow.report(args.project_root, state),
     }
 
 
@@ -2084,6 +2527,16 @@ def parser() -> argparse.ArgumentParser:
     search.add_argument("--max-chars", type=int, default=500)
     check = sub.add_parser("check")
     check.add_argument("--strict", action="store_true")
+    check.add_argument("--stage", choices=("all", "structure", "product", "engineering", "planning", "specification", "implementation", "verification", "acceptance"), default="all")
+    check.add_argument("--requirement", action="append", help="Scope delivery diagnostics to a REQ; repeatable. Structure checks remain project-wide.")
+    doctor = sub.add_parser("doctor", help="Diagnose handoff gaps and produce executable recovery guidance; never changes REQ states.")
+    doctor.add_argument("--requirement", action="append")
+    doctor.add_argument("--write-report", action="store_true", help="Refresh the full generated DEVELOPMENT-GUIDE.md.")
+    flow = sub.add_parser("workflow", help="Inspect stage receipts, exact AC coverage and remaining work; no automatic passing.")
+    flow.add_argument("--requirement", action="append")
+    flow.add_argument("--stage", choices=("all", *workflow.STAGES), default="all")
+    flow.add_argument("--strict", action="store_true")
+    flow.add_argument("--write-report", action="store_true")
     resume = sub.add_parser("resume")
     resume.add_argument("--hours", type=int, default=72)
     imp = sub.add_parser("import-session")
@@ -2110,6 +2563,10 @@ def main(argv: list[str] | None = None) -> int:
             result, code = cmd_search(args), 0
         elif args.command == "check":
             result, code = cmd_check(args)
+        elif args.command == "doctor":
+            result, code = cmd_doctor(args), 0
+        elif args.command == "workflow":
+            result, code = cmd_workflow(args)
         elif args.command == "resume":
             result, code = cmd_resume(args), 0
         elif args.command == "import-session":
@@ -2118,7 +2575,7 @@ def main(argv: list[str] | None = None) -> int:
             raise PMError(f"unknown command: {args.command}")
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return code
-    except PMError as exc:
+    except (PMError, workflow.WorkflowError) as exc:
         print(json.dumps({"error": str(exc), "command": args.command}, ensure_ascii=False, indent=2), file=sys.stderr)
         return 2
 

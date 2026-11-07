@@ -1,0 +1,125 @@
+{
+  "schema_version": 1,
+  "format": "repository-local skill dependency manifest; not a Codex auto-installer schema",
+  "snapshot_date": "2026-11-07",
+  "repository": "https://github.com/redmaplewww/project-manager-skill",
+  "runtime": {
+    "python": ">=3.10",
+    "requirements_file": "requirements.txt",
+    "timezone": "IANA timezone data; install tzdata where system data is unavailable"
+  },
+  "skills": [
+    {
+      "name": "project-manager",
+      "path": "project-manager",
+      "entrypoint": "project-manager/SKILL.md",
+      "role": "primary",
+      "required_skills": [
+        "project-to-act"
+      ],
+      "conditional_skills": [
+        {
+          "name": "project-development",
+          "when": "Engineering investigation/package handoff after confirmation answers, closure or requirement version changes; implementation requires existing authorization and build gates."
+        }
+      ]
+    },
+    {
+      "name": "project-to-act",
+      "path": "project-to-act",
+      "entrypoint": "project-to-act/SKILL.md",
+      "role": "governance foundation",
+      "required_skills": [],
+      "conditional_skills": [
+        {
+          "name": "project-manager",
+          "when": "The project adopts PM structured state and DELIVERY-1."
+        },
+        {
+          "name": "project-development",
+          "when": "The project uses versioned software engineering packages."
+        }
+      ]
+    },
+    {
+      "name": "project-development",
+      "path": "project-development",
+      "entrypoint": "project-development/SKILL.md",
+      "role": "engineering handoff and development",
+      "required_skills": [],
+      "conditional_skills": [
+        {
+          "name": "project-to-act",
+          "when": "The project has a project-to-act governance source."
+        },
+        {
+          "name": "project-manager",
+          "when": "The requirements are managed by PM; use its write operations, locks and DELIVERY-1."
+        }
+      ]
+    }
+  ],
+  "optional_integrations": [
+    {
+      "skills": [
+        "figma-generate-design",
+        "figma-use"
+      ],
+      "when": "Editable Figma layouts/design systems",
+      "prerequisites": [
+        "Figma tool connection and target file"
+      ]
+    },
+    {
+      "skills": [
+        "figma-implement-design"
+      ],
+      "when": "Implement an existing Figma design",
+      "prerequisites": [
+        "Figma URL/node and MCP access; load prerequisite skills required by the implementation skill"
+      ]
+    },
+    {
+      "skills": [
+        "webapp-testing"
+      ],
+      "when": "Test a running local web application",
+      "prerequisites": [
+        "Runnable application and browser testing environment"
+      ]
+    },
+    {
+      "skills": [
+        "playwright"
+      ],
+      "when": "Browser automation, debugging and interaction evidence",
+      "prerequisites": [
+        "Browser automation environment"
+      ]
+    },
+    {
+      "skills": [
+        "canvas-design"
+      ],
+      "when": "Static PNG/PDF concept or presentation artwork",
+      "prerequisites": [
+        "Drawing and font environment required by the skill"
+      ]
+    },
+    {
+      "skills": [
+        "presentations"
+      ],
+      "aliases": [
+        "presentations:Presentations"
+      ],
+      "when": "Requested review slide deck",
+      "prerequisites": [
+        "Presentation authoring runtime"
+      ]
+    }
+  ],
+  "optional_skills_bundled": false,
+  "dependency_reference": "project-manager/references/skill-dependencies.md",
+  "routing_reference": "project-manager/references/external-skill-routing.md"
+}

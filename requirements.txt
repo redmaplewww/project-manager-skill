@@ -1,0 +1,2 @@
+# Python >= 3.10. Other runtime modules are in the standard library.
+tzdata>=2024.1; sys_platform == "win32"
